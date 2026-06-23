@@ -1,6 +1,6 @@
 # 🤖 AI Assistant Telegram Bot
 
-A powerful, feature-rich Telegram bot acting as your private AI companion. This bot integrates **Google Gemini, OpenAI, and Claude** to provide intelligent conversations, image generation, web searches, and document analysis.
+A powerful, feature-rich Telegram bot acting as your private AI companion. This bot integrates **Google Gemini, OpenAI, and Claude** API to provide intelligent conversations, image generation, web searches, and document analysis.
 
 It includes a robust **User Management System** (via MongoDB) to track usage, enforce limits, and manage access (Public/Private modes).
 
@@ -124,4 +124,4 @@ This bot is for educational and personal use.
 
 ---
 
-**Made with ❤️ using Node.js and Gemini**
+**Made with ❤️ by Aman**

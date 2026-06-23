@@ -28,6 +28,7 @@ const RATE_LIMIT = (parseInt(process.env.RATE_LIMIT_MS)) * 1000;
 const COMMAND_LIMIT = (parseInt(process.env.COMMAND_LIMIT_MS)) * 1000;
 
 const SEARCH_LIMIT = parseInt(process.env.SEARCH_LIMIT);
+const SEARCH_RESULTS = parseInt(process.env.SEARCH_RESULTS) || 5;
 const IMAGINE_LIMIT = parseInt(process.env.IMAGINE_LIMIT);
 const DOC_LIMIT = parseInt(process.env.LIMIT_DOC_ANALYSIS);
 const LIMIT_IMG = parseInt(process.env.LIMIT_IMG_ANALYSIS);
@@ -307,11 +308,11 @@ const mainKeyboard = {
 
 // --- Register Commands with Telegram ---
 bot.setMyCommands([
-  { command: "start", description: "🤖About the bot" },
+  { command: "start", description: "🚀Check if bot is avtive" },
   { command: "help", description: "📝List of commands" },
   { command: "account", description: "👤 My account info" },
   { command: "language", description: "🌐 Change language" },
-  { command: "setmodel", description: "🐱‍👤 Select Ai Models" },
+  { command: "setmodel", description: "🤖 Select Ai Models" },
   { command: "clearchat", description: "🧹 Clear chat history" },
   { command: "about", description: "👀About this bot" },
   { command: "terms", description: "📜 Terms of service" },
@@ -460,8 +461,8 @@ bot.onText(/\/terms/, async (msg) => {
     reply_markup: {
       inline_keyboard: [
         [
-          { text: "📄 Full Terms of Service", url: "https://telegram-bot-1-qzck.onrender.com/terms" },
-          { text: "🔒 Privacy Policy", url: "https://telegram-bot-1-qzck.onrender.com/privacy" }
+          { text: "📄 Full Terms of Service", url: `${RENDER_URL}/terms` },
+          { text: "🔒 Privacy Policy", url: `${RENDER_URL}/privacy` }
         ]
       ]
     }
@@ -665,8 +666,6 @@ bot.onText(/\/search (.+)/, async (msg, match) => {
     }
 
     const data = await res.json();
-
-    const SEARCH_RESULTS = parseInt(process.env.SEARCH_RESULTS);
 
     const results = data.organic?.slice(0, SEARCH_RESULTS)
       .map((r, i) => `${i + 1}. [${r.title}](${r.link})\n${r.snippet}`)

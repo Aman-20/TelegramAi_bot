@@ -308,7 +308,7 @@ const mainKeyboard = {
 
 // --- Register Commands with Telegram ---
 bot.setMyCommands([
-  { command: "start", description: "🚀Check if bot is avtive" },
+  { command: "start", description: "🚀Check if bot is alive" },
   { command: "help", description: "📝List of commands" },
   { command: "account", description: "👤 My account info" },
   { command: "language", description: "🌐 Change language" },
@@ -418,7 +418,7 @@ bot.onText(/\/about/, async (msg) => {
 - OpenAi API
 - Claude API
 - MongoDB for data storage
-- Node.js`);
+- Node.js for backend`);
 });
 
 

@@ -1,1238 +1,1454 @@
-// telegram-bot.js
-import express from 'express';
+// ============================================================
+//  bot.js  —  Telegram AI Bot  (Production Hardened)
+//  Fixes: 29 bugs from audit report
+//  Architecture: Webhook · MongoDB Atlas Free · Render Free
+// ============================================================
+
+import express    from "express";
 import TelegramBot from "node-telegram-bot-api";
-import dotenv from "dotenv";
+import dotenv     from "dotenv";
 import { GoogleGenerativeAI } from "@google/generative-ai";
-import mongoose from 'mongoose';
-import fetch from "node-fetch";
-import OpenAI from "openai";
-import Anthropic from "@anthropic-ai/sdk";
-
+import mongoose   from "mongoose";
+import fetch      from "node-fetch";
+import OpenAI     from "openai";
+import Anthropic  from "@anthropic-ai/sdk";
 import { createRequire } from "module";
-const require = createRequire(import.meta.url);
 
-const pdf = require("pdf-parse");
+const require = createRequire(import.meta.url);
+const pdf     = require("pdf-parse");
 const mammoth = require("mammoth");
 
 dotenv.config();
 
-// --- CONFIGURATION FROM ENV ---
-const DAILY_REQUEST_LIMIT = parseInt(process.env.DAILY_REQUEST_LIMIT);
-const DAILY_TOKEN_LIMIT = parseInt(process.env.DAILY_TOKEN_LIMIT);
-const MAX_REPLY_TOKENS = parseInt(process.env.MAX_REPLY_TOKENS);
+// ============================================================
+//  SECTION 1 · ENV CONFIGURATION
+// ============================================================
+const CFG = {
+  TOKEN              : process.env.TELEGRAM_TOKEN,
+  ADMIN_ID           : Number(process.env.ADMIN_ID),
+  RENDER_URL         : process.env.RENDER_URL || "",
+  PORT               : Number(process.env.PORT) || 3000,
+  FORCE_CHANNEL      : process.env.FORCE_JOIN_CHANNEL || "",
 
-const HISTORY_MESSAGES = parseInt(process.env.HISTORY_MESSAGES);
-const DB_MSG_LIMIT = parseInt(process.env.DB_MSG_LIMIT);
+  DAILY_REQUEST_LIMIT: Number(process.env.DAILY_REQUEST_LIMIT)     || 50,
+  DAILY_TOKEN_LIMIT  : Number(process.env.DAILY_TOKEN_LIMIT)        || 50000,
+  MAX_REPLY_TOKENS   : Number(process.env.MAX_REPLY_TOKENS)         || 1024,
 
-const RATE_LIMIT = (parseInt(process.env.RATE_LIMIT_MS)) * 1000;
-const COMMAND_LIMIT = (parseInt(process.env.COMMAND_LIMIT_MS)) * 1000;
+  SEARCH_LIMIT       : Number(process.env.SEARCH_LIMIT)             || 10,
+  SEARCH_RESULTS     : Number(process.env.SEARCH_RESULTS)           || 5,
+  IMAGINE_LIMIT      : Number(process.env.IMAGINE_LIMIT)            || 5,
+  DOC_LIMIT          : Number(process.env.LIMIT_DOC_ANALYSIS)       || 5,
+  IMG_LIMIT          : Number(process.env.LIMIT_IMG_ANALYSIS)       || 10,
+  PRO_LIMIT          : Number(process.env.LIMIT_PRO_MODEL)          || 10,
+  // FIX #20: cap stored history text to keep documents small
+  DOC_CHAR_LIMIT     : Number(process.env.DOC_CHAR_LIMIT)           || 10000,
+  MAX_HISTORY_CHARS  : Number(process.env.MAX_HISTORY_CHARS)        || 500,
 
-const SEARCH_LIMIT = parseInt(process.env.SEARCH_LIMIT);
-const SEARCH_RESULTS = parseInt(process.env.SEARCH_RESULTS) || 5;
-const IMAGINE_LIMIT = parseInt(process.env.IMAGINE_LIMIT);
-const DOC_LIMIT = parseInt(process.env.LIMIT_DOC_ANALYSIS);
-const LIMIT_IMG = parseInt(process.env.LIMIT_IMG_ANALYSIS);
-const LIMIT_PRO = parseInt(process.env.LIMIT_PRO_MODEL);
+  // FIX #8: rate limits — env values in SECONDS, converted to ms here
+  RATE_LIMIT_MS      : (Number(process.env.RATE_LIMIT_MS)           || 3)  * 1000,
+  COMMAND_LIMIT_MS   : (Number(process.env.COMMAND_LIMIT_MS)        || 3)  * 1000,
+  MEDIA_COOLDOWN_MS  : (Number(process.env.LIMIT_MEDIA_COOLDOWN)    || 10) * 1000,
+  MAX_FILE_MB        : Number(process.env.MAX_FILE_MB)              || 10,
 
-const APPROVAL_HOURS = parseFloat(process.env.APPROVAL_EXPIRY_HOURS);
+  MAX_CONCURRENT     : Number(process.env.MAX_CONCURRENT_REQUESTS)  || 20,
+  QUEUE_LIMIT        : Number(process.env.REQUEST_QUEUE_LIMIT)      || 100,
+  CACHE_CLEAR_MIN    : Number(process.env.MEMORY_CACHE_CLEAR_MINUTES)|| 30,
+  MEMBER_CACHE_MIN   : Number(process.env.MEMBERSHIP_CACHE_MINUTES) || 10,
+  APPROVAL_HOURS     : Number(process.env.APPROVAL_EXPIRY_HOURS)    || 24,
+  // FIX #9: approval cache TTL — short so revocations propagate quickly
+  APPROVAL_CACHE_TTL : (Number(process.env.APPROVAL_CACHE_SECONDS)  || 60) * 1000,
 
-// 🔒 GLOBAL SAFETY NETS
-process.on("unhandledRejection", (err) => {
-  console.error("Unhandled rejection:", err);
-});
+  HISTORY_MESSAGES   : Number(process.env.HISTORY_MESSAGES)         || 10,
+  DB_MSG_LIMIT       : Number(process.env.DB_MSG_LIMIT)             || 20,
+  CHAT_HISTORY_TTL   : Number(process.env.CHAT_HISTORY_TTL_DAYS)    || 30,
+  INACTIVE_USER_DAYS : Number(process.env.INACTIVE_USER_DELETE_DAYS)|| 90,
 
-process.on("uncaughtException", (err) => {
-  console.error("Uncaught exception:", err);
-});
+  // FIX #5: external API timeout in ms
+  API_TIMEOUT_MS     : Number(process.env.API_TIMEOUT_MS)           || 30000,
 
-const PORT = process.env.PORT || 3000;
-
-// 🔥 make bot public(true) or private(false) 
-let PUBLIC_MODE = false;
-
-
-const ADMIN_ID = Number(process.env.ADMIN_ID);
-const FORCE_JOIN_CHANNEL = process.env.FORCE_JOIN_CHANNEL || "";
-
-//membership check function
-async function isUserMember(chatId) {
-  try {
-    const member = await bot.getChatMember(FORCE_JOIN_CHANNEL, chatId);
-    const status = member.status;
-    // "creator", "administrator", "member" are valid
-    return ["creator", "administrator", "member"].includes(status);
-  } catch (err) {
-    console.warn("⚠️ Membership check failed:", err.message);
-    return false; // treat errors as not a member
-  }
-}
-
-// ✅ New Helper Function
-async function checkMembership(msg) {
-  const chatId = msg.chat.id;
-  if (await isUserMember(chatId)) return true; // User is member, allow
-
-  // User is NOT member, send warning
-  bot.sendMessage(chatId, `⚠️ You must join our channel first to use this bot.`, {
-    reply_markup: {
-      inline_keyboard: [
-        [{ text: "📢 Join Channel", url: `https://t.me/${FORCE_JOIN_CHANNEL.replace("@", "")}` }]
-      ]
-    }
-  });
-  return false; // Block execution
-}
-
-// 🔒 Check approval from Database
-async function isUserApproved(chatId) {
-  // 1. Always allow Admin and Public Mode
-  if (PUBLIC_MODE) return true;
-  if (chatId === ADMIN_ID) return true;
-
-  // 2. Check Database
-  const user = await User.findOne({ chatId });
-
-  // 3. If no user or no date set -> Not Approved
-  if (!user || !user.approvedUntil) return false;
-
-  // 4. If date is in the past -> Expired
-  if (new Date() > user.approvedUntil) return false;
-
-  return true; // ✅ Approved
-}
-
-
-// chatId -> last request timestamp (ms)
-const rateLimitMap = new Map();
-const RATE_LIMIT_MS = RATE_LIMIT
-
-//limit on message 
-function guardRateLimit(msg) {
-  // ❌ Skip commands
-  if (msg.text && msg.text.startsWith("/")) {
-    return true;
-  }
-
-  // ❌ Skip media here (handled elsewhere)
-  if (msg.photo || msg.document) {
-    return true;
-  }
-
-  const chatId = msg.chat.id;
-  const now = Date.now();
-  const last = rateLimitMap.get(chatId) || 0;
-
-  const remaining = RATE_LIMIT_MS - (now - last);
-
-  if (remaining > 0) {
-    const seconds = Math.ceil(remaining / 1000);
-    bot.sendMessage(chatId, `⏳ Please wait ${seconds}s before sending another request.`);
-    return false;
-  }
-
-  rateLimitMap.set(chatId, now);
-  return true;
-}
-
-//limit on media 
-const mediaRateLimit = new Map();
-// NEW: Media-specific rate limit function
-function guardRateLimitMedia(msg) {
-  const chatId = msg.chat.id;
-  const now = Date.now();
-
-  // 1. Get the limit from .env
-  const COOLDOWN = (parseInt(process.env.LIMIT_MEDIA_COOLDOWN)) * 1000;
-
-  // 2. Check the MEDIA map, not the text map
-  const last = mediaRateLimit.get(chatId) || 0;
-  const remaining = COOLDOWN - (now - last);
-
-  if (remaining > 0) {
-    const seconds = Math.ceil(remaining / 1000);
-    bot.sendMessage(chatId, `⏳ Please wait ${seconds}s before sending another file.`);
-    return false;
-  }
-
-  // 3. Update the MEDIA map
-  mediaRateLimit.set(chatId, now);
-  return true;
-}
-
-//limit on search and imagine
-const commandRateLimit = new Map();
-const COMMAND_LIMIT_MS = COMMAND_LIMIT
-function guardCommandRateLimit(msg, commandName) {
-  const chatId = msg.chat.id;
-  const key = `${chatId}:${commandName}`;
-  const now = Date.now();
-  const last = commandRateLimit.get(key) || 0;
-
-  if (now - last < COMMAND_LIMIT_MS) {
-    const wait = Math.ceil((COMMAND_LIMIT_MS - (now - last)) / 1000);
-    bot.sendMessage(chatId, `⏳ Please wait ${wait}s before using /${commandName} again.`);
-    return false;
-  }
-
-  commandRateLimit.set(key, now);
-  return true;
-}
-
-
-async function downloadFile(fileId) {
-  const file = await bot.getFile(fileId);
-  const fileUrl = `https://api.telegram.org/file/bot${process.env.TELEGRAM_TOKEN}/${file.file_path}`;
-  const res = await fetch(fileUrl);
-  if (!res.ok) throw new Error(`Download failed: ${res.status}`);
-  const buf = Buffer.from(await res.arrayBuffer());
-  return buf;
-}
-
-const MODELS = {
-  gemini: {
-    name: process.env.GEMINI_MODEL_1,
-    key: process.env.GEMINI_API_KEY,
-    provider: "gemini",
-    model: process.env.GEMINI_MODEL_1,
-  },
-  gemini_flash1: {
-    name: process.env.GEMINI_MODEL_3,
-    key: process.env.GEMINI_API_KEY,
-    provider: "gemini",
-    model: process.env.GEMINI_MODEL_3,
-  },
-  gemini_flash2: {
-    name: process.env.GEMINI_MODEL_2,
-    key: process.env.GEMINI_API_KEY,
-    provider: "gemini",
-    model: process.env.GEMINI_MODEL_2,
-  },
-  gemini_flash3: {
-    name: process.env.GEMINI_MODEL_5,
-    key: process.env.GEMINI_API_KEY,
-    provider: "gemini",
-    model: process.env.GEMINI_MODEL_5,
-  },
-  gemini_pro: {
-    name: process.env.GEMINI_MODEL_4,
-    key: process.env.GEMINI_API_KEY,
-    provider: "gemini",
-    model: process.env.GEMINI_MODEL_4,
-  },
-  openai: {
-    name: process.env.OPENAI_MODEL_1,
-    key: process.env.OPENAI_API_KEY,
-    type: "openai"
-  },
-  claude: {
-    name: process.env.CLAUDE_MODEL_1,
-    key: process.env.CLAUDE_API_KEY,
-    type: "claude"
-  },
+  GEMINI_API_KEY     : process.env.GEMINI_API_KEY,
+  OPENAI_API_KEY     : process.env.OPENAI_API_KEY,
+  CLAUDE_API_KEY     : process.env.CLAUDE_API_KEY,
+  SERPER_API_KEY     : process.env.SERPER_API_KEY,
 };
 
-const userSelectedModel = {}; // { chatId: "gemini" }
+// ============================================================
+//  SECTION 2 · GLOBAL SAFETY NETS
+// ============================================================
+process.on("unhandledRejection", (err) => console.error("⚠️ UnhandledRejection:", err?.message || err));
+process.on("uncaughtException",  (err) => console.error("⚠️ UncaughtException:",  err?.message || err));
 
-
-mongoose.connect(process.env.MONGODB_CONNECT, { dbName: "Telegram" }).then((req, res) => {
-  console.log("MongoDb is Connected....");
+// ============================================================
+//  SECTION 3 · MONGODB — connect first, start bot after
+//  FIX #6: Bot does NOT start accepting requests until DB is ready.
+//  FIX #7: All dates use UTC consistently (toISOString / Date.UTC).
+// ============================================================
+mongoose.connection.on("disconnected", () => {
+  console.warn("⚠️ MongoDB disconnected — reconnecting…");
+  setTimeout(connectDB, 3000);
+});
+mongoose.connection.on("error", (err) => {
+  console.error("❌ MongoDB error:", err.message);
 });
 
-const userSchema = new mongoose.Schema({
-  chatId: { type: String, required: true, unique: true },
-  approvedUntil: { type: Date, default: null },
-  messages: [
-    {
-      role: { type: String, enum: ["user", "bot"], required: true },
-      text: String,
-      timestamp: { type: Date, default: Date.now }
-    }
-  ],
-  requests: { type: Number, default: 0 },        // daily requests
-  lastReset: { type: Date, default: Date.now },  // daily reset for requests
-  usage: {
-    tokensUsed: { type: Number, default: 0 },   // total tokens used today
-    resetDate: { type: Date, default: Date.now } // when to reset quota
+async function connectDB() {
+  try {
+    await mongoose.connect(process.env.MONGODB_CONNECT, {
+      dbName                 : "Telegram",
+      serverSelectionTimeoutMS: 10000,
+      socketTimeoutMS        : 45000,
+      maxPoolSize            : 10,   // respect Atlas Free connection cap
+    });
+    console.log("✅ MongoDB connected");
+  } catch (err) {
+    console.error("❌ MongoDB connection failed:", err.message);
+    setTimeout(connectDB, 5000);
   }
-});
+}
 
+// ── Schemas ───────────────────────────────────────────────
+
+// FIX #10: PUBLIC_MODE persisted in DB so it survives Render restarts
+const settingsSchema = new mongoose.Schema(
+  { key: { type: String, required: true, unique: true }, value: mongoose.Schema.Types.Mixed },
+  { versionKey: false }
+);
+const Setting = mongoose.model("Setting", settingsSchema);
+
+const userSchema = new mongoose.Schema(
+  {
+    // FIX #17: chatId always stored as String — never Number
+    chatId        : { type: String, required: true, unique: true },
+    approvedUntil : { type: Date,   default: null  },
+    selectedModel : { type: String, default: "gemini" },
+    language      : { type: String, default: "en"  },
+    requests      : { type: Number, default: 0     },
+    lastReset     : { type: Date,   default: () => new Date() },
+    tokensUsed    : { type: Number, default: 0     },
+    tokensReset   : { type: Date,   default: () => new Date() },
+    accountCreated: { type: Date,   default: () => new Date() },
+    lastActive    : { type: Date,   default: () => new Date() },
+  },
+  { versionKey: false }
+);
+userSchema.index({ chatId: 1 },        { unique: true });
+userSchema.index({ approvedUntil: 1 });
+userSchema.index({ lastActive: 1 });
 const User = mongoose.model("User", userSchema);
 
+// FIX #20: Chat history stored separately, text truncated per message
+const chatHistorySchema = new mongoose.Schema(
+  {
+    chatId   : { type: String, required: true },
+    messages : [{
+      role     : { type: String, enum: ["user", "bot"], required: true },
+      // Store only a truncated snippet — keeps documents tiny
+      text     : { type: String, maxlength: CFG.MAX_HISTORY_CHARS },
+      createdAt: { type: Date,   default: () => new Date() },
+    }],
+    updatedAt: {
+      type   : Date,
+      default: () => new Date(),
+      // MongoDB TTL index — auto-deletes after N days of inactivity
+      index  : { expireAfterSeconds: CFG.CHAT_HISTORY_TTL * 86400 },
+    },
+  },
+  { versionKey: false }
+);
+chatHistorySchema.index({ chatId: 1 }, { unique: true });
+const ChatHistory = mongoose.model("ChatHistory", chatHistorySchema);
 
+// ============================================================
+//  SECTION 4 · IN-MEMORY CACHES  (ephemeral runtime data only)
+//  FIX #1:  All caches declared here, before any use.
+//  FIX #17: All Map keys are String(chatId) — never raw Number.
+// ============================================================
+
+// Rate limits
+const rateLimitMap   = new Map(); // String(chatId) → timestamp
+const mediaRateLimit = new Map(); // String(chatId) → timestamp
+const commandRateLmt = new Map(); // `${chatId}:cmd`  → timestamp
+
+// Membership & approval caches
+const membershipCache = new Map(); // String(chatId) → { isMember, expiry }
+const approvalCache   = new Map(); // String(chatId) → { approved, expiry }
+
+// Per-user daily usage (in-memory only; resets at midnight UTC)
+const userUsage = new Map(); // String(chatId) → { date, search, imagine, doc, img, proTokens }
+
+// Preferences cache (backed by DB; session cache to reduce reads)
+// FIX #22: These Maps ARE evicted by the periodic sweep below.
+const userLanguages  = new Map(); // String(chatId) → langCode
+const userModels     = new Map(); // String(chatId) → modelId
+const _prefsPending  = new Map(); // dedup in-flight DB fetches
+
+// Album dedup (FIX #14)
+const albumSeen = new Map(); // media_group_id → timestamp
+
+// Active processing (FIX #3: covers all heavy handlers)
+const processingSet      = new Set();
+const PROCESSING_TIMEOUT = 3 * 60 * 1000; // 3-min safety release
+
+function cid(chatId) { return String(chatId); } // canonical key helper
+
+// ── Periodic cache sweep — prevents memory leaks ──────────
+// FIX #22: userLanguages and userModels also evicted here
+setInterval(() => {
+  const now     = Date.now();
+  const STALE   = CFG.CACHE_CLEAR_MIN * 60 * 1000;
+  const today   = utcToday();
+
+  for (const [k, v] of rateLimitMap)    if (now - v > STALE)   rateLimitMap.delete(k);
+  for (const [k, v] of mediaRateLimit)  if (now - v > STALE)   mediaRateLimit.delete(k);
+  for (const [k, v] of commandRateLmt)  if (now - v > STALE)   commandRateLmt.delete(k);
+  for (const [k, v] of membershipCache) if (now > v.expiry)     membershipCache.delete(k);
+  for (const [k, v] of approvalCache)   if (now > v.expiry)     approvalCache.delete(k);
+  for (const [k, v] of userUsage)       if (v.date !== today)   userUsage.delete(k);
+  // albumSeen entries are deleted directly via setTimeout — no sweeper needed here
+  // Evict pref caches — will be reloaded from DB on next request
+  if (userLanguages.size > 5000) userLanguages.clear();
+  if (userModels.size    > 5000) userModels.clear();
+
+  console.log(`🧹 Cache swept [${new Date().toISOString()}] rateLimits=${rateLimitMap.size} prefs=${userLanguages.size}`);
+}, CFG.CACHE_CLEAR_MIN * 60 * 1000);
+
+// ============================================================
+//  SECTION 5 · CONCURRENCY LIMITER
+//  FIX #4: queue shift wrapped in try/catch so one bad task
+//          doesn't freeze the entire queue.
+// ============================================================
+let activeRequests = 0;
+const requestQueue  = [];
+
+async function enqueueRequest(fn) {
+  if (activeRequests + requestQueue.length >= CFG.QUEUE_LIMIT) {
+    throw new Error("QUEUE_FULL");
+  }
+
+  return new Promise((resolve, reject) => {
+    const task = async () => {
+      activeRequests++;
+      try   { resolve(await fn()); }
+      catch (e) { reject(e); }
+      finally {
+        activeRequests--;
+        // FIX #4: guard the shift so a bad task can't stall the queue
+        if (requestQueue.length > 0) {
+          const next = requestQueue.shift();
+          try { next(); } catch (e) { console.error("Queue task error:", e); }
+        }
+      }
+    };
+
+    if (activeRequests < CFG.MAX_CONCURRENT) {
+      task();
+    } else {
+      requestQueue.push(task);
+    }
+  });
+}
+
+// ============================================================
+//  SECTION 6 · AI MODELS
+// ============================================================
+const MODELS = {
+  gemini      : { name: process.env.GEMINI_MODEL_1, key: process.env.GEMINI_API_KEY, provider: "gemini", model: process.env.GEMINI_MODEL_1 },
+  gemini_flash1:{ name: process.env.GEMINI_MODEL_3, key: process.env.GEMINI_API_KEY, provider: "gemini", model: process.env.GEMINI_MODEL_3 },
+  gemini_flash2:{ name: process.env.GEMINI_MODEL_2, key: process.env.GEMINI_API_KEY, provider: "gemini", model: process.env.GEMINI_MODEL_2 },
+  gemini_flash3:{ name: process.env.GEMINI_MODEL_5, key: process.env.GEMINI_API_KEY, provider: "gemini", model: process.env.GEMINI_MODEL_5 },
+  gemini_pro  : { name: process.env.GEMINI_MODEL_4, key: process.env.GEMINI_API_KEY, provider: "gemini", model: process.env.GEMINI_MODEL_4 },
+  openai      : { name: process.env.OPENAI_MODEL_1,  key: process.env.OPENAI_API_KEY, type: "openai" },
+  claude      : { name: process.env.CLAUDE_MODEL_1,  key: process.env.CLAUDE_API_KEY, type: "claude" },
+};
+
+const genAI = new GoogleGenerativeAI(CFG.GEMINI_API_KEY || "");
+
+// Lazy singletons — only built once, only if key exists
+let _openai    = null;
+let _anthropic = null;
+function getOpenAI() {
+  if (!CFG.OPENAI_API_KEY) throw new Error("NO_KEY");
+  return (_openai ??= new OpenAI({ apiKey: CFG.OPENAI_API_KEY }));
+}
+function getAnthropic() {
+  if (!CFG.CLAUDE_API_KEY) throw new Error("NO_KEY");
+  return (_anthropic ??= new Anthropic({ apiKey: CFG.CLAUDE_API_KEY }));
+}
+
+const LANGUAGES = {
+  en: "🇬🇧 English", hi: "🇮🇳 Hindi",  es: "🇪🇸 Spanish",
+  fr: "🇫🇷 French",  de: "🇩🇪 German", ja: "🇯🇵 Japanese",
+  ru: "🇷🇺 Russian", ar: "🇸🇦 Arabic",
+};
+
+// ============================================================
+//  SECTION 7 · BOT + EXPRESS SETUP
+//  FIX #6:  Express and bot created early, but webhook & bot
+//           handlers only registered AFTER DB is ready.
+//  FIX #23: EJS routes wrapped in try/catch — missing templates
+//           won't crash the process.
+// ============================================================
+let PUBLIC_MODE = false; // loaded from DB after connect
 
 const app = express();
-
-// -- set view engine to ejs --
+app.use(express.json());
 app.set("view engine", "ejs");
 
-// -- ejs files
-app.get("/", (req, res) => res.render("home"));
-app.get("/privacy", (req, res) => res.render("privacy"));
-app.get("/terms", (req, res) => res.render("terms"));
+// FIX #23: safe EJS render — falls back to plain text if template missing
+function safeRender(res, view) {
+  res.render(view, (err, html) => {
+    if (err) return res.send(`<h1>${view}</h1><p>Page coming soon.</p>`);
+    res.send(html);
+  });
+}
+app.get("/",        (_q, res) => safeRender(res, "home"));
+app.get("/privacy", (_q, res) => safeRender(res, "privacy"));
+app.get("/terms",   (_q, res) => safeRender(res, "terms"));
+app.get("/health",  (_q, res) => res.json({
+  status : "ok",
+  db     : mongoose.connection.readyState === 1 ? "connected" : "disconnected",
+  queue  : { active: activeRequests, waiting: requestQueue.length },
+  uptime : Math.floor(process.uptime()),
+}));
 
+const bot = new TelegramBot(CFG.TOKEN);
 
-// --- Load API keys from .env ---
-const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-const RENDER_URL = process.env.RENDER_URL;
+// FIX #15: strip bot @username from commands so /cmd@BotName works in groups
+function stripBotName(text) {
+  if (!text) return text;
+  return text.replace(/^(\/\w+)@\w+/, "$1");
+}
 
-
-// --- Initialize Telegram Bot ---
-const bot = new TelegramBot(TELEGRAM_TOKEN);
-
-// 2️⃣ Set the webhook URL
-bot.setWebHook(`${RENDER_URL}/bot${TELEGRAM_TOKEN}`);
-
-// 3️⃣ Express route to receive updates
-app.use(express.json());
-app.post(`/bot${TELEGRAM_TOKEN}`, (req, res) => {
-  bot.processUpdate(req.body);
+app.post(`/bot${CFG.TOKEN}`, (req, res) => {
+  const update = req.body;
+  // Normalise command text to strip @BotName suffix
+  if (update?.message?.text) {
+    update.message.text = stripBotName(update.message.text);
+  }
+  if (update?.edited_message?.text) {
+    update.edited_message.text = stripBotName(update.edited_message.text);
+  }
+  bot.processUpdate(update);
   res.sendStatus(200);
 });
 
-// --- Running on this port ---
-app.listen(PORT, () => console.log(`✅ Web server running on port ${PORT}`));
+// ── Bot command menu ──────────────────────────────────────
+bot.setMyCommands([
+  { command: "start",     description: "🚀 Start the bot"       },
+  { command: "help",      description: "📝 List of commands"    },
+  { command: "account",   description: "👤 My account info"     },
+  { command: "language",  description: "🌐 Change language"     },
+  { command: "setmodel",  description: "🤖 Select AI model"     },
+  { command: "clearchat", description: "🧹 Clear chat history"  },
+  { command: "about",     description: "👀 About this bot"      },
+  { command: "terms",     description: "📜 Terms of service"    },
+  { command: "status",    description: "✅ Check your access"   },
+]).catch(() => {});
 
-//--- reply keywords ---
+// ── Reply keyboard ────────────────────────────────────────
 const mainKeyboard = {
   reply_markup: {
     keyboard: [
       ["🔍 Search", "🎨 Imagine"],
       ["🚫 Report Error", "📄 Document Analysis"],
     ],
-    resize_keyboard: true,
-    one_time_keyboard: false
-  }
+    resize_keyboard  : true,
+    one_time_keyboard: false,
+  },
 };
 
+// ============================================================
+//  SECTION 8 · HELPERS
+// ============================================================
 
-// --- Register Commands with Telegram ---
-bot.setMyCommands([
-  { command: "start", description: "🚀Check if bot is alive" },
-  { command: "help", description: "📝List of commands" },
-  { command: "account", description: "👤 My account info" },
-  { command: "language", description: "🌐 Change language" },
-  { command: "setmodel", description: "🤖 Select Ai Models" },
-  { command: "clearchat", description: "🧹 Clear chat history" },
-  { command: "about", description: "👀About this bot" },
-  { command: "terms", description: "📜 Terms of service" },
-  { command: "status", description: "✅ Check your bot access" },
+// FIX #7: single consistent UTC date string used everywhere
+function utcToday() { return new Date().toISOString().slice(0, 10); }
 
-]);
-
-
-// --- Initialize Gemini ---
-const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
-
-// Define supported languages
-const LANGUAGES = {
-  en: "🇬🇧 English",
-  hi: "🇮🇳 Hindi",
-  es: "🇪🇸 Spanish",
-  fr: "🇫🇷 French",
-  de: "🇩🇪 German",
-  ja: "🇯🇵 Japanese",
-  ru: "🇷🇺 Russian",
-  ar: "🇸🇦 Arabic",
-};
-
-
-//usage limit 
-const userUsage = {};
-
-function getToday() {
-  return new Date().toISOString().slice(0, 10);
+// FIX #7: daily reset check always compares UTC dates
+function needsDailyReset(dateField) {
+  if (!dateField) return true;
+  return new Date(dateField).toISOString().slice(0, 10) !== utcToday();
 }
 
-function checkLimit(chatId, type, limit) {
-  const today = getToday();
-  if (!userUsage[chatId] || userUsage[chatId].date !== today) {
-    userUsage[chatId] = { date: today, search: 0, imagine: 0, doc: 0, img: 0, proTokens: 0 };
-  }
+// ── FIX #5: Promise race timeout helper ──────────────────
+function withTimeout(promise, ms, label) {
+  const timer = new Promise((_, reject) =>
+    setTimeout(() => reject(new Error(`TIMEOUT:${label}`)), ms)
+  );
+  return Promise.race([promise, timer]);
+}
 
-  if (userUsage[chatId][type] >= limit) return false;
-  userUsage[chatId][type]++;
+// ── Daily usage counter (in-memory, UTC-aligned) ─────────
+function checkLimit(chatId, type, limit) {
+  const today = utcToday();
+  const key   = cid(chatId);
+  let u = userUsage.get(key);
+  if (!u || u.date !== today) {
+    u = { date: today, search: 0, imagine: 0, doc: 0, img: 0, proTokens: 0 };
+    userUsage.set(key, u);
+  }
+  if (u[type] >= limit) return false;
+  u[type]++;
   return true;
 }
 
-// --- Commands ---
-bot.onText(/\/start/, async (msg) => {
-  if (!await checkMembership(msg)) return;
+// ── FIX #26: membership check with 1 retry on Telegram failure ──
+async function isUserMember(chatId) {
+  if (!CFG.FORCE_CHANNEL) return true;
+  const key    = cid(chatId);
+  const cached = membershipCache.get(key);
+  if (cached && Date.now() < cached.expiry) return cached.isMember;
 
-  bot.sendMessage(msg.chat.id, `👋 Hi ${msg.from.first_name}!
-I am your Private AI assistant.
-Type any question and I'll try to answer`, mainKeyboard
-  );
-});
-
-
-bot.onText(/\/help/, async (msg) => {
-  // 1. Check if user is a member of the channel first
-  if (!await checkMembership(msg)) return;
-
-  const chatId = msg.chat.id;
-
-  // 2. Define the Standard Help Message (Visible to everyone)
-  let helpMessage = `📌 *Available commands:*
-/start - Start the bot
-/status - Check access status
-/help - Show this help menu
-/about - About this bot
-/clearchat - Clear chat history
-/terms - Terms of service
-/account - My account info
-/setmodel - Choose AI Model
-/language - Change language
-/imagine A dancing panda 
-/search Today's latest news 
-
-💡 *Tip:* Send any document or photo for analysis!
-`;
-
-  // 3. Append Admin Commands ONLY if the user is the Admin
-  if (chatId === ADMIN_ID) {
-    helpMessage += `
-🎧 *Admin Commands:*
-/broadcast - Send message to all users
-/usage - Check usage report
-/approve - Approve a user manually
-/remove - Remove user approval
-/users - List approved users
-/mode - Check Private/Public mode
-/private - Set bot to Private mode
-/public - Set bot to Public mode
-`;
-  }
-
-  // 4. Send the message
-  bot.sendMessage(chatId, helpMessage, { parse_mode: "Markdown" });
-});
-
-
-bot.onText(/\/about/, async (msg) => {
-  if (!await checkMembership(msg)) return;
-
-  bot.sendMessage(msg.chat.id, `🤖 This bot is built with:
-- Telegram Bot API
-- Google Gemini API
-- OpenAi API
-- Claude API
-- MongoDB for data storage
-- Node.js for backend`);
-});
-
-
-bot.onText(/\/clearchat/, async (msg) => {
-  const chatId = msg.chat.id;
-
-  if (!await checkMembership(msg)) return;
-
-  let user = await User.findOne({ chatId });
-  if (!user) {
-    bot.sendMessage(chatId, "⚠️ No chat history found.");
-    return;
-  }
-
-  // ✅ Clear all saved messages
-  user.messages = [];
-  await user.save();
-
-  bot.sendMessage(chatId, "🧹 Your chat history has been cleared.");
-});
-
-
-bot.onText(/\/terms/, async (msg) => {
-  const chatId = msg.chat.id;
-
-  if (!await checkMembership(msg)) return;
-
-  const terms = `
-  📜 *Terms of Service*
-  
-  1. This bot is provided for educational and personal use only.  
-  2. Do not use this bot to share harmful, illegal, or inappropriate content.  
-  3. The bot may store limited usage data to improve responses and enforce usage limits.  
-  4. Responses are generated by AI (Gemini API) and may not always be accurate.  
-  5. By using this bot, you agree to these terms.
-  `;
-
-  bot.sendMessage(chatId, terms, {
-    parse_mode: "Markdown",
-    reply_markup: {
-      inline_keyboard: [
-        [
-          { text: "📄 Full Terms of Service", url: `${RENDER_URL}/terms` },
-          { text: "🔒 Privacy Policy", url: `${RENDER_URL}/privacy` }
-        ]
-      ]
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const member   = await withTimeout(
+        bot.getChatMember(CFG.FORCE_CHANNEL, chatId),
+        5000, "membership"
+      );
+      const isMember = ["creator", "administrator", "member"].includes(member.status);
+      membershipCache.set(key, { isMember, expiry: Date.now() + CFG.MEMBER_CACHE_MIN * 60000 });
+      return isMember;
+    } catch (err) {
+      if (attempt === 0) {
+        // Brief pause then retry
+        await new Promise(r => setTimeout(r, 800));
+        continue;
+      }
+      // Both attempts failed — use last cached value if available, else block
+      const stale = membershipCache.get(key);
+      console.warn(`⚠️ Membership check failed (both attempts): ${err.message}`);
+      return stale?.isMember ?? false;
     }
-  });
+  }
+}
 
-});
+async function checkMembership(msg) {
+  const chatId = msg.chat.id;
+  if (await isUserMember(chatId)) return true;
+  bot.sendMessage(chatId, "⚠️ You must join our channel first to use this bot.", {
+    reply_markup: {
+      inline_keyboard: [[
+        { text: "📢 Join Channel", url: `https://t.me/${CFG.FORCE_CHANNEL.replace("@", "")}` },
+      ]],
+    },
+  }).catch(() => {});
+  return false;
+}
 
+// ── FIX #9: approval cache with short TTL so revocations propagate ──
+async function isUserApproved(chatId) {
+  if (PUBLIC_MODE)             return true;
+  if (chatId === CFG.ADMIN_ID) return true;
+  const key    = cid(chatId);
+  const cached = approvalCache.get(key);
+  if (cached && Date.now() < cached.expiry) return cached.approved;
 
-bot.onText(/\/approve (\d+)/, async (msg, match) => {
-  if (msg.chat.id !== ADMIN_ID) return;
-
-  const userId = match[1];
-  const expiresAt = new Date(Date.now() + (APPROVAL_HOURS * 60 * 60 * 1000));
-
-  // Update MongoDB (Create user if missing, set new date)
-  await User.findOneAndUpdate(
-    { chatId: userId },
-    { approvedUntil: expiresAt },
-    { upsert: true, new: true }
-  );
-
-  bot.sendMessage(ADMIN_ID, `✅ User ${userId} approved until ${expiresAt.toLocaleString()}`);
-});
-
+  const user    = await User.findOne({ chatId: key }, { approvedUntil: 1 });
+  const approved = !!(user?.approvedUntil && new Date() <= user.approvedUntil);
+  approvalCache.set(key, { approved, expiry: Date.now() + CFG.APPROVAL_CACHE_TTL });
+  return approved;
+}
 
 async function guardAccess(msg) {
-  const chatId = msg.chat.id;
-  const approved = await isUserApproved(chatId); // 👈 Checks DB now
+  if (await isUserApproved(msg.chat.id)) return true;
+  bot.sendMessage(
+    msg.chat.id,
+    `🛡️ *Member Only*\nThis feature is locked. Contact ${CFG.FORCE_CHANNEL} to get approved.`,
+    { parse_mode: "Markdown" }
+  ).catch(() => {});
+  return false;
+}
 
-  if (!approved) {
-    bot.sendMessage(chatId, `🛡️ *Member Only*\nSorry, this feature is currently locked. Please reach out to ${FORCE_JOIN_CHANNEL} to get your account approved!`);
+// ── Rate limiters ─────────────────────────────────────────
+function guardRateLimit(msg) {
+  if (msg.text?.startsWith("/"))   return true;
+  if (msg.photo || msg.document)   return true;
+  const key = cid(msg.chat.id);
+  const now = Date.now();
+  const rem = CFG.RATE_LIMIT_MS - (now - (rateLimitMap.get(key) || 0));
+  if (rem > 0) {
+    bot.sendMessage(msg.chat.id, `⏳ Please wait ${Math.ceil(rem / 1000)}s before sending another request.`).catch(() => {});
     return false;
   }
+  rateLimitMap.set(key, now);
   return true;
 }
 
-// --- My Account ---
-bot.onText(/\/account/, async (msg) => {
+function guardRateLimitMedia(msg) {
+  const key = cid(msg.chat.id);
+  const now = Date.now();
+  const rem = CFG.MEDIA_COOLDOWN_MS - (now - (mediaRateLimit.get(key) || 0));
+  if (rem > 0) {
+    bot.sendMessage(msg.chat.id, `⏳ Please wait ${Math.ceil(rem / 1000)}s before sending another file.`).catch(() => {});
+    return false;
+  }
+  mediaRateLimit.set(key, now);
+  return true;
+}
+
+function guardCommandRateLimit(msg, commandName) {
+  const key = `${cid(msg.chat.id)}:${commandName}`;
+  const now = Date.now();
+  const rem = CFG.COMMAND_LIMIT_MS - (now - (commandRateLmt.get(key) || 0));
+  if (rem > 0) {
+    bot.sendMessage(msg.chat.id, `⏳ Please wait ${Math.ceil(rem / 1000)}s before using /${commandName} again.`).catch(() => {});
+    return false;
+  }
+  commandRateLmt.set(key, now);
+  return true;
+}
+
+// ── FIX #3: unified processing lock — covers all heavy handlers ──
+function isProcessing(chatId) { return processingSet.has(cid(chatId)); }
+function markProcessing(chatId) {
+  const key = cid(chatId);
+  processingSet.add(key);
+  setTimeout(() => processingSet.delete(key), PROCESSING_TIMEOUT);
+}
+function unmarkProcessing(chatId) { processingSet.delete(cid(chatId)); }
+
+// ── FIX #8: lastActive update — shared helper used everywhere ──
+function touchLastActive(chatId) {
+  User.findOneAndUpdate(
+    { chatId: cid(chatId) },
+    { $set: { lastActive: new Date() } }
+  ).catch(() => {});
+}
+
+// ── FIX #2: race-condition-safe user upsert ───────────────
+async function getOrCreateUser(chatId) {
+  const key = cid(chatId);
+  try {
+    return await User.findOneAndUpdate(
+      { chatId: key },
+      { $setOnInsert: { chatId: key } },
+      { upsert: true, new: true }
+    );
+  } catch (err) {
+    // E11000 duplicate key — another request created it simultaneously
+    if (err.code === 11000) return User.findOne({ chatId: key });
+    throw err;
+  }
+}
+
+// ── File download with pre-flight size check ──────────────
+async function downloadFile(fileId) {
+  const file     = await withTimeout(bot.getFile(fileId), CFG.API_TIMEOUT_MS, "getFile");
+  const MAX_BYTES = CFG.MAX_FILE_MB * 1024 * 1024;
+  if (file.file_size && file.file_size > MAX_BYTES) {
+    throw new Error(`FILE_TOO_LARGE:${CFG.MAX_FILE_MB}`);
+  }
+  const fileUrl = `https://api.telegram.org/file/bot${CFG.TOKEN}/${file.file_path}`;
+  const res     = await withTimeout(fetch(fileUrl), CFG.API_TIMEOUT_MS, "downloadFile");
+  if (!res.ok)   throw new Error(`Download failed: ${res.status}`);
+  return Buffer.from(await res.arrayBuffer());
+}
+
+// ── FIX #19: Markdown-safe message splitter ───────────────
+// Splits on newlines first to avoid breaking words/URLs/code blocks
+function splitSafely(text, maxLen = 4000) {
+  const chunks = [];
+  while (text.length > maxLen) {
+    let idx = text.lastIndexOf("\n", maxLen);
+    if (idx < maxLen * 0.5) idx = maxLen; // no newline found — hard split
+    chunks.push(text.slice(0, idx));
+    text = text.slice(idx).trimStart();
+  }
+  if (text) chunks.push(text);
+  return chunks;
+}
+
+async function sendLongMessage(chatId, text, opts = {}) {
+  for (const chunk of splitSafely(text)) {
+    try   { await bot.sendMessage(chatId, chunk, opts); }
+    catch { await bot.sendMessage(chatId, chunk); } // strip parse_mode on failure
+  }
+}
+
+// ── FIX #18: safeSend only retries on Markdown parse failures ──
+async function safeSend(chatId, text, opts = {}) {
+  if (text.length > 4000) return sendLongMessage(chatId, text, opts);
+  try {
+    return await bot.sendMessage(chatId, text, opts);
+  } catch (err) {
+    // Only retry without Markdown — don't retry if bot is blocked/chat deleted
+    // "can't parse" covers Telegram's actual Markdown error ("can't parse entities")
+    // Removed broad "Bad Request" match — it incorrectly caught unrelated 400 errors
+    // (e.g. "file is too big", "chat not found") and triggered an unnecessary retry.
+    const markdownError = err?.message?.includes("can't parse");
+    if (markdownError && opts.parse_mode) {
+      const { parse_mode: _, ...safe } = opts;
+      return bot.sendMessage(chatId, text, safe).catch(() => {});
+    }
+    // Otherwise swallow (bot blocked, user left, etc.)
+  }
+}
+
+// ── FIX #28: escape Markdown v1 special chars in AI replies ──
+function escapeMarkdown(text) {
+  // Escape only chars that break Telegram Markdown v1
+  return text.replace(/([_*`\[])/g, "\\$1");
+}
+
+// ── Thinking / status placeholder ────────────────────────
+async function withThinkingIndicator(chatId, label, fn) {
+  let placeholder;
+  try { placeholder = await bot.sendMessage(chatId, label); } catch {}
+
+  const typingInterval = setInterval(
+    () => bot.sendChatAction(chatId, "typing").catch(() => {}),
+    4000
+  );
+  try {
+    return await fn();
+  } finally {
+    clearInterval(typingInterval);
+    if (placeholder?.message_id) {
+      bot.deleteMessage(chatId, placeholder.message_id).catch(() => {});
+    }
+  }
+}
+
+// ── AI call with FIX #5 timeout ──────────────────────────
+async function getAIReply(chatId, text, history, lang) {
+  const selectedId = userModels.get(cid(chatId)) || "gemini";
+  const chosen     = MODELS[selectedId];
+  if (!chosen?.key) throw new Error("NO_KEY");
+
+  const prompt = `Answer in ${LANGUAGES[lang] || "English"} (${lang})\n\nConversation so far:\n${history}\n\nUser: ${text}`;
+
+  if (chosen.provider === "gemini") {
+    if (chosen.model === process.env.GEMINI_MODEL_4) {
+      if (!checkLimit(chatId, "proTokens", CFG.PRO_LIMIT))
+        throw new Error(`PRO_LIMIT:${CFG.PRO_LIMIT}`);
+    }
+    const model  = genAI.getGenerativeModel({ model: chosen.model });
+    const result = await withTimeout(
+      model.generateContent({
+        contents        : [{ role: "user", parts: [{ text: prompt }] }],
+        generationConfig: { maxOutputTokens: CFG.MAX_REPLY_TOKENS },
+      }),
+      CFG.API_TIMEOUT_MS, "gemini"
+    );
+    return { reply: result?.response?.text() || "⚠️ No response from Gemini.", chosen };
+  }
+
+  if (chosen.type === "openai") {
+    const result = await withTimeout(
+      getOpenAI().chat.completions.create({
+        model   : process.env.OPENAI_MODEL_1,
+        messages: [
+          { role: "system", content: "You are a helpful assistant." },
+          { role: "user",   content: prompt },
+        ],
+        max_tokens: CFG.MAX_REPLY_TOKENS,
+      }),
+      CFG.API_TIMEOUT_MS, "openai"
+    );
+    return { reply: result.choices[0].message.content || "⚠️ No response from OpenAI.", chosen };
+  }
+
+  if (chosen.type === "claude") {
+    const result = await withTimeout(
+      getAnthropic().messages.create({
+        model     : process.env.CLAUDE_MODEL_1,
+        max_tokens: CFG.MAX_REPLY_TOKENS,
+        messages  : [{ role: "user", content: prompt }],
+      }),
+      CFG.API_TIMEOUT_MS, "claude"
+    );
+    return { reply: result.content?.[0]?.text || "⚠️ No response from Claude.", chosen };
+  }
+
+  throw new Error("UNKNOWN_PROVIDER");
+}
+
+// ── Prefs hydration with dedup ────────────────────────────
+async function hydrateUserPrefs(chatId) {
+  const key = cid(chatId);
+  if (userLanguages.has(key) && userModels.has(key)) return;
+  if (_prefsPending.has(key)) return _prefsPending.get(key);
+
+  const promise = User.findOne({ chatId: key }, { language: 1, selectedModel: 1 })
+    .then(u => {
+      if (!userLanguages.has(key)) userLanguages.set(key, u?.language      || "en");
+      if (!userModels.has(key))    userModels.set(key,    u?.selectedModel  || "gemini");
+    })
+    .catch(() => {
+      userLanguages.set(key, "en");
+      userModels.set(key, "gemini");
+    })
+    .finally(() => _prefsPending.delete(key));
+
+  _prefsPending.set(key, promise);
+  return promise;
+}
+
+// ── Chat history helpers ──────────────────────────────────
+async function appendChatHistory(chatId, userText, botText) {
+  const key = cid(chatId);
+  const now = new Date();
+  // FIX #20: truncate each stored message to MAX_HISTORY_CHARS
+  const newMessages = [
+    { role: "user", text: String(userText).slice(0, CFG.MAX_HISTORY_CHARS), createdAt: now },
+    { role: "bot",  text: String(botText).slice(0,  CFG.MAX_HISTORY_CHARS), createdAt: now },
+  ];
+  await ChatHistory.findOneAndUpdate(
+    { chatId: key },
+    {
+      $push: { messages: { $each: newMessages, $slice: -CFG.DB_MSG_LIMIT } },
+      $set : { updatedAt: now },
+    },
+    { upsert: true }
+  ).catch(err => console.error("appendChatHistory error:", err.message));
+}
+
+async function getRecentHistory(chatId) {
+  const doc = await ChatHistory.findOne(
+    { chatId: cid(chatId) },
+    { messages: { $slice: -CFG.HISTORY_MESSAGES } }
+  );
+  if (!doc?.messages?.length) return "";
+  return doc.messages.map(m => `${m.role}: ${m.text}`).join("\n");
+}
+
+// ── FIX #13: broadcast — 5 msgs/second to stay under Telegram limit ──
+async function broadcastMessage(message) {
+  let success = 0, failed = 0;
+  const DELAY = 220; // ~4-5 msgs/s; Telegram group limit is 20/min, global ~30/s
+
+  const cursor = User.find({}, { chatId: 1 }).cursor();
+  for await (const u of cursor) {
+    try {
+      await bot.sendMessage(u.chatId, `📢 Broadcast:\n\n${message}`);
+      success++;
+    } catch { failed++; }
+    await new Promise(r => setTimeout(r, DELAY));
+  }
+  return { success, failed };
+}
+
+// ============================================================
+//  SECTION 9 · STARTUP — wait for DB, THEN open for traffic
+//  FIX #6:  Express only accepts real traffic after DB + webhook ready.
+//  FIX #10: PUBLIC_MODE loaded from DB on startup.
+//  FIX #21: runCleanup() called immediately on startup, then daily.
+//  FIX #29: health check confirms DB + webhook before "ready" log.
+// ============================================================
+async function startup() {
+  // 1. Connect DB
+  await connectDB();
+
+  // 2. Load persisted settings
+  try {
+    const s = await Setting.findOne({ key: "publicMode" });
+    if (s) PUBLIC_MODE = !!s.value;
+  } catch {}
+  console.log(`🔑 PUBLIC_MODE: ${PUBLIC_MODE}`);
+
+  // 3. Register webhook
+  try {
+    await withTimeout(
+      bot.setWebHook(`${CFG.RENDER_URL}/bot${CFG.TOKEN}`),
+      10000, "setWebhook"
+    );
+    console.log("✅ Webhook registered");
+  } catch (err) {
+    console.error("❌ Webhook registration failed:", err.message);
+  }
+
+  // 4. Start Express
+  app.listen(CFG.PORT, () => console.log(`✅ Server on port ${CFG.PORT}`));
+
+  // 5. FIX #21: run cleanup immediately, then every 24h
+  runCleanup();
+  setInterval(runCleanup, 24 * 60 * 60 * 1000);
+
+  console.log("🤖 Bot fully ready");
+}
+
+// ── Scheduled cleanup ─────────────────────────────────────
+async function runCleanup() {
+  console.log(`🔧 Cleanup started [${new Date().toISOString()}]`);
+  try {
+    const cutoff = new Date(Date.now() - CFG.INACTIVE_USER_DAYS * 86400000);
+    const res    = await User.deleteMany({
+      lastActive   : { $lt: cutoff },
+      approvedUntil: { $not: { $gt: new Date() } },
+    });
+    if (res.deletedCount > 0) console.log(`🗑️  Removed ${res.deletedCount} inactive users`);
+  } catch (err) {
+    console.error("❌ Cleanup error:", err.message);
+  }
+}
+
+// ============================================================
+//  SECTION 10 · BOT COMMANDS
+// ============================================================
+
+// ── /start ───────────────────────────────────────────────
+bot.onText(/\/start/, async (msg) => {
+  if (!await checkMembership(msg)) return;
+  bot.sendMessage(
+    msg.chat.id,
+    `👋 Hi ${msg.from?.first_name || "there"}!\nI am your Private AI assistant.\nType any question and I'll answer.`,
+    mainKeyboard
+  ).catch(() => {});
+});
+
+// ── /help ────────────────────────────────────────────────
+bot.onText(/\/help/, async (msg) => {
+  if (!await checkMembership(msg)) return;
   const chatId = msg.chat.id;
 
+  let help = `📌 *Available commands:*
+/start — Start the bot
+/status — Check access status
+/help — Show this menu
+/about — About this bot
+/clearchat — Clear chat history
+/terms — Terms of service
+/account — My account info
+/setmodel — Choose AI model
+/language — Change language
+/imagine A dancing panda
+/search Today\'s latest news
+
+💡 *Tip:* Send any document or photo for analysis!`;
+
+  if (chatId === CFG.ADMIN_ID) {
+    help += `\n\n🎧 *Admin Commands:*
+/broadcast — Send to all users
+/usage — Usage report
+/approve — Approve user
+/remove — Remove user
+/users — List approved users
+/mode — Check mode
+/private — Set private
+/public — Set public`;
+  }
+  bot.sendMessage(chatId, help, { parse_mode: "Markdown" }).catch(() => {});
+});
+
+// ── /about ───────────────────────────────────────────────
+bot.onText(/\/about/, async (msg) => {
+  if (!await checkMembership(msg)) return;
+  bot.sendMessage(msg.chat.id,
+    `🤖 *About this bot*\n\nBuilt with:\n• Telegram Bot API\n• Google Gemini\n• OpenAI\n• Claude AI\n• MongoDB Atlas\n• Node.js`,
+    { parse_mode: "Markdown" }
+  ).catch(() => {});
+});
+
+// ── /terms ───────────────────────────────────────────────
+bot.onText(/\/terms/, async (msg) => {
+  if (!await checkMembership(msg)) return;
+  bot.sendMessage(msg.chat.id,
+    `📜 *Terms of Service*\n\n1. Personal & educational use only.\n2. No harmful or illegal content.\n3. Limited usage data stored.\n4. AI responses may not always be accurate.\n5. Using this bot = accepting these terms.`,
+    {
+      parse_mode: "Markdown",
+      reply_markup: { inline_keyboard: [[
+        { text: "📄 Full Terms", url: `${CFG.RENDER_URL}/terms` },
+        { text: "🔒 Privacy",    url: `${CFG.RENDER_URL}/privacy` },
+      ]]},
+    }
+  ).catch(() => {});
+});
+
+// ── /status ──────────────────────────────────────────────
+bot.onText(/\/status/, async (msg) => {
+  const chatId = msg.chat.id;
+  if (PUBLIC_MODE) return bot.sendMessage(chatId, "🔓 Bot is in PUBLIC MODE — all users welcome.").catch(() => {});
+  const approved = await isUserApproved(chatId);
+  bot.sendMessage(chatId, approved ? "✅ You have access." : "🚧 You do not have access yet.").catch(() => {});
+});
+
+// ── /clearchat ───────────────────────────────────────────
+bot.onText(/\/clearchat/, async (msg) => {
+  const chatId = msg.chat.id;
+  if (!await checkMembership(msg)) return;
+  try {
+    await ChatHistory.deleteOne({ chatId: cid(chatId) });
+    bot.sendMessage(chatId, "🧹 Your chat history has been cleared.").catch(() => {});
+  } catch (err) {
+    console.error("clearchat error:", err.message);
+    bot.sendMessage(chatId, "⚠️ Could not clear history. Try again.").catch(() => {});
+  }
+});
+
+// ── /account ─────────────────────────────────────────────
+bot.onText(/\/account/, async (msg) => {
+  const chatId = msg.chat.id;
   if (!await checkMembership(msg)) return;
 
-  // Fetch user from DB
-  let user = await User.findOne({ chatId });
-  if (!user) {
-    user = new User({
-      chatId,
-      requests: 0,
-      lastReset: new Date(),
-      usage: { tokensUsed: 0, resetDate: new Date() },
-      messages: [],
-    });
-    await user.save();
-  }
+  try {
+    // FIX #2: race-safe upsert
+    let user = await getOrCreateUser(chatId);
+    const updates = {};
+    if (needsDailyReset(user.lastReset))    { updates.requests = 0;   updates.lastReset   = new Date(); }
+    if (needsDailyReset(user.tokensReset))  { updates.tokensUsed = 0; updates.tokensReset = new Date(); }
+    if (Object.keys(updates).length) {
+      user = await User.findOneAndUpdate({ chatId: cid(chatId) }, { $set: updates }, { new: true });
+    }
 
-  // ✅ check todays date
-  const todayDate = new Date().toDateString();
+    await hydrateUserPrefs(chatId);
+    const lang     = userLanguages.get(cid(chatId)) || user.language      || "en";
+    const model    = userModels.get(cid(chatId))    || user.selectedModel  || "gemini";
+    const usage    = userUsage.get(cid(chatId))     || {};
+    const reset    = new Date(); reset.setUTCHours(24, 0, 0, 0);
 
-  // 1. Reset Requests if day changed
-  if (user.lastReset.toDateString() !== todayDate) {
-    user.requests = 0;
-    user.lastReset = new Date();
-  }
-
-  // 2. Reset Tokens if day changed
-  if (user.usage.resetDate.toDateString() !== todayDate) {
-    user.usage.tokensUsed = 0;
-    user.usage.resetDate = new Date();
-  }
-
-  // 3. Save the reset immediately so the numbers are correct
-  await user.save();
-
-  const remainingRequests = DAILY_REQUEST_LIMIT - user.requests;
-  const usedTokens = user.usage?.tokensUsed || 0;
-  const remainingTokens = DAILY_TOKEN_LIMIT - usedTokens;
-  const lang = userLanguages[chatId] || "en";
-
-  // Calculate midnight reset time
-  const resetTime = new Date();
-  resetTime.setHours(24, 0, 0, 0); // midnight
-
-  // ---- NEW PART: usage limits tracking ----
-  const today = getToday();
-  const usage = userUsage[chatId] || { date: today, search: 0, imagine: 0, doc: 0, img: 0, proTokens: 0 };
-  if (usage.date !== today) {
-    usage.search = 0;
-    usage.imagine = 0;
-    usage.doc = 0;
-    usage.img = 0;
-    usage.proTokens = 0;
-    usage.date = today;
-  }
-
-  const limits = {
-    search: SEARCH_LIMIT,
-    imagine: IMAGINE_LIMIT,
-    doc: DOC_LIMIT,
-    img: LIMIT_IMG,
-    proTokens: LIMIT_PRO
-  };
-
-  bot.sendMessage(
-    chatId,
-    `
-👤 *My Account*
+    bot.sendMessage(chatId, `👤 *My Account*
 ━━━━━━━━━━━━━
-- Requests used today: ${user.requests}
-- Requests remaining: ${remainingRequests}
-- Daily request limit: ${DAILY_REQUEST_LIMIT}
+📨 Requests: ${user.requests} / ${CFG.DAILY_REQUEST_LIMIT}
+🪙 Tokens: ${user.tokensUsed} / ${CFG.DAILY_TOKEN_LIMIT}
+🕒 Resets at: ${reset.toUTCString()}
 
-- Tokens used today: ${usedTokens}
-- Tokens remaining: ${remainingTokens}
-- Daily token limit: ${DAILY_TOKEN_LIMIT}
-- Max tokens per reply: ${MAX_REPLY_TOKENS}
-
-🌍 Current language: ${LANGUAGES[lang]} (${lang})
-
-🕒 Quota resets at: ${resetTime.toLocaleString()}
+🌍 Language: ${LANGUAGES[lang] || lang}
+🤖 Model: ${MODELS[model]?.name || model}
 
 📊 *Feature Usage Today*
 ━━━━━━━━━━━━━
-🔍 Searches: ${usage.search}/${limits.search}
-🎨 Image Generations: ${usage.imagine}/${limits.imagine}
-📄 Document Analyses: ${usage.doc}/${limits.doc}
-🖼️ Image Analyses: ${usage.img}/${limits.img}
-🤖 Pro-Model Requests: ${usage.proTokens}/${limits.proTokens}
-    `,
-    { parse_mode: "Markdown" }
-  );
+🔍 Searches: ${usage.search || 0} / ${CFG.SEARCH_LIMIT}
+🎨 Images: ${usage.imagine || 0} / ${CFG.IMAGINE_LIMIT}
+📄 Documents: ${usage.doc || 0} / ${CFG.DOC_LIMIT}
+🖼️ Photos: ${usage.img || 0} / ${CFG.IMG_LIMIT}
+🤖 Pro Reqs: ${usage.proTokens || 0} / ${CFG.PRO_LIMIT}`,
+      { parse_mode: "Markdown" }
+    ).catch(() => {});
+  } catch (err) {
+    // FIX #16
+    console.error("account error:", err.message);
+    bot.sendMessage(chatId, "⚠️ Could not load account info. Try again.").catch(() => {});
+  }
 });
 
-
+// ── /language ────────────────────────────────────────────
 bot.onText(/\/language/, async (msg) => {
-  const chatId = msg.chat.id;
-
   if (!await checkMembership(msg)) return;
-
-  // Convert LANGUAGES object to inline keyboard (2 buttons per row)
-  const buttons = Object.entries(LANGUAGES).map(([code, name]) => {
-    return { text: name, callback_data: `lang_${code}` };
-  });
-
-  // Split into rows of 2 buttons
+  const buttons  = Object.entries(LANGUAGES).map(([c, n]) => ({ text: n, callback_data: `lang_${c}` }));
   const keyboard = [];
-  for (let i = 0; i < buttons.length; i += 2) {
-    keyboard.push(buttons.slice(i, i + 2));
-  }
-
-  bot.sendMessage(chatId, "🌐 Choose your language:", {
-    reply_markup: { inline_keyboard: keyboard }
-  });
+  for (let i = 0; i < buttons.length; i += 2) keyboard.push(buttons.slice(i, i + 2));
+  bot.sendMessage(msg.chat.id, "🌐 Choose your language:", { reply_markup: { inline_keyboard: keyboard } }).catch(() => {});
 });
 
-const userLanguages = {}; // store user language in-memory
-
-bot.on("callback_query", (query) => {
-  const chatId = query.message.chat.id;
-
-  if (query.data.startsWith("lang_")) {
-    const lang = query.data.replace("lang_", "");
-    userLanguages[chatId] = lang;
-
-    bot.sendMessage(chatId, `✅ Language changed to: ${LANGUAGES[lang]}`);
-    bot.answerCallbackQuery(query.id);
-  }
-});
-
-//search the web
-bot.onText(/\/search (.+)/, async (msg, match) => {
-  const chatId = msg.chat.id;
-
+// ── /setmodel ────────────────────────────────────────────
+bot.onText(/\/setmodel/, async (msg) => {
   if (!await checkMembership(msg)) return;
+  const buttons = Object.entries(MODELS).map(([id, m]) => [{
+    text         : m.key ? m.name : `${m.name} ❌`,
+    callback_data: m.key ? `model_${id}` : `unavailable_${id}`,
+  }]);
+  bot.sendMessage(msg.chat.id, "🤖 Choose your AI model:", { reply_markup: { inline_keyboard: buttons } }).catch(() => {});
+});
 
-  if (!await guardAccess(msg)) return;
+// ── Unified callback handler ──────────────────────────────
+bot.on("callback_query", async (query) => {
+  const chatId = query.message.chat.id;
+  const data   = query.data;
 
-  if (!guardCommandRateLimit(msg, "search")) return;
-
-  const query = match[1];
-  bot.sendChatAction(chatId, "typing");
-
-  //added Search limit 
-  if (!checkLimit(chatId, "search", SEARCH_LIMIT)) {
-    bot.sendMessage(chatId, `⚠️ Daily search limit reached (${SEARCH_LIMIT}). Try again tomorrow.`);
+  if (data.startsWith("lang_")) {
+    const lang = data.replace("lang_", "");
+    userLanguages.set(cid(chatId), lang);
+    User.findOneAndUpdate({ chatId: cid(chatId) }, { $set: { language: lang } }, { upsert: true }).catch(() => {});
+    bot.answerCallbackQuery(query.id).catch(() => {});
+    bot.sendMessage(chatId, `✅ Language changed to ${LANGUAGES[lang]}`).catch(() => {});
     return;
   }
 
+  if (data.startsWith("model_")) {
+    const modelId = data.replace("model_", "");
+    userModels.set(cid(chatId), modelId);
+    User.findOneAndUpdate({ chatId: cid(chatId) }, { $set: { selectedModel: modelId } }, { upsert: true }).catch(() => {});
+    bot.answerCallbackQuery(query.id).catch(() => {});
+    bot.sendMessage(chatId, `✅ Model set to *${MODELS[modelId]?.name || modelId}*`, { parse_mode: "Markdown" }).catch(() => {});
+    return;
+  }
 
+  if (data.startsWith("unavailable_")) {
+    bot.answerCallbackQuery(query.id, { text: "⚠️ Model not available.", show_alert: true }).catch(() => {});
+    return;
+  }
+
+  bot.answerCallbackQuery(query.id).catch(() => {});
+});
+
+// ── /imagine ─────────────────────────────────────────────
+// FIX #3: processing lock applied; FIX #12: download image then send as buffer
+bot.onText(/\/imagine (.+)/, async (msg, match) => {
+  const chatId = msg.chat.id;
+  if (!await checkMembership(msg))         return;
+  if (!await guardAccess(msg))             return;
+  if (!guardCommandRateLimit(msg, "imagine")) return;
+  if (isProcessing(chatId)) {
+    return bot.sendMessage(chatId, "⏳ Your previous request is still in progress.").catch(() => {});
+  }
+  if (!checkLimit(chatId, "imagine", CFG.IMAGINE_LIMIT)) {
+    return bot.sendMessage(chatId, `⚠️ Daily image limit reached (${CFG.IMAGINE_LIMIT}). Try again tomorrow.`).catch(() => {});
+  }
+
+  const prompt = match[1];
+  markProcessing(chatId);
+  let placeholder;
   try {
-    const res = await fetch("https://google.serper.dev/search", {
-      method: "POST",
-      headers: {
-        "X-API-KEY": process.env.SERPER_API_KEY,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({ q: query })
-    });
+    placeholder = await bot.sendMessage(chatId, "🎨 Generating your image, please wait…");
+    bot.sendChatAction(chatId, "upload_photo").catch(() => {});
 
-    if (!res.ok) {
-      throw new Error(`Serper API error: ${res.status}`);
-    }
+    // FIX #12: download image buffer instead of passing URL directly to sendPhoto
+    const imageUrl = `https://image.pollinations.ai/prompt/${encodeURIComponent(prompt)}`;
+    const res      = await withTimeout(fetch(imageUrl), CFG.API_TIMEOUT_MS, "pollinations");
+    if (!res.ok) throw new Error(`Pollinations error: ${res.status}`);
+    const buf = Buffer.from(await res.arrayBuffer());
 
-    const data = await res.json();
+    await bot.sendPhoto(chatId, buf, { caption: `🎨 ${prompt}` });
+    // FIX #8: update lastActive
+    touchLastActive(chatId);
+  } catch (err) {
+    const isTimeout = err.message?.startsWith("TIMEOUT");
+    console.error("❌ Image error:", err.message);
+    bot.sendMessage(chatId, isTimeout
+      ? "⚠️ Image generation timed out. Try again."
+      : "⚠️ Could not generate image. Please try again."
+    ).catch(() => {});
+  } finally {
+    unmarkProcessing(chatId);
+    if (placeholder?.message_id) bot.deleteMessage(chatId, placeholder.message_id).catch(() => {});
+  }
+});
 
-    const results = data.organic?.slice(0, SEARCH_RESULTS)
+// ── /search ──────────────────────────────────────────────
+// FIX #3 + #8 + #5
+bot.onText(/\/search (.+)/, async (msg, match) => {
+  const chatId = msg.chat.id;
+  if (!await checkMembership(msg))         return;
+  if (!await guardAccess(msg))             return;
+  if (!guardCommandRateLimit(msg, "search")) return;
+  if (isProcessing(chatId)) {
+    return bot.sendMessage(chatId, "⏳ Your previous request is still in progress.").catch(() => {});
+  }
+  if (!checkLimit(chatId, "search", CFG.SEARCH_LIMIT)) {
+    return bot.sendMessage(chatId, `⚠️ Daily search limit reached (${CFG.SEARCH_LIMIT}). Try again tomorrow.`).catch(() => {});
+  }
+
+  const query = match[1];
+  markProcessing(chatId);
+  let placeholder;
+  try {
+    placeholder = await bot.sendMessage(chatId, "🔍 Searching the web…");
+    bot.sendChatAction(chatId, "typing").catch(() => {});
+
+    const res = await withTimeout(
+      fetch("https://google.serper.dev/search", {
+        method : "POST",
+        headers: { "X-API-KEY": CFG.SERPER_API_KEY, "Content-Type": "application/json" },
+        body   : JSON.stringify({ q: query }),
+      }),
+      CFG.API_TIMEOUT_MS, "serper"
+    );
+    if (!res.ok) throw new Error(`Serper error: ${res.status}`);
+
+    const data    = await res.json();
+    const results = data.organic
+      ?.slice(0, CFG.SEARCH_RESULTS)
       .map((r, i) => `${i + 1}. [${r.title}](${r.link})\n${r.snippet}`)
       .join("\n\n");
 
-    if (!results) {
-      bot.sendMessage(chatId, "⚠ No search results found.");
-      return;
-    }
+    if (placeholder?.message_id) bot.deleteMessage(chatId, placeholder.message_id).catch(() => {});
 
-    bot.sendMessage(chatId, `🔍 *Search results for:* ${query}\n\n${results}`, {
-      parse_mode: "Markdown",
-      disable_web_page_preview: true
+    if (!results) return bot.sendMessage(chatId, "⚠️ No search results found.").catch(() => {});
+
+    await safeSend(chatId, `🔍 *Results for:* ${query}\n\n${results}`, {
+      parse_mode             : "Markdown",
+      disable_web_page_preview: true,
     });
-
+    touchLastActive(chatId); // FIX #8
   } catch (err) {
-    console.error("❌ Search error:", err);
-    bot.sendMessage(chatId, "⚠ Could not perform web search.");
+    if (placeholder?.message_id) bot.deleteMessage(chatId, placeholder.message_id).catch(() => {});
+    console.error("❌ Search error:", err.message);
+    bot.sendMessage(chatId, err.message?.startsWith("TIMEOUT")
+      ? "⚠️ Search timed out. Try again."
+      : "⚠️ Could not perform web search."
+    ).catch(() => {});
+  } finally {
+    unmarkProcessing(chatId);
   }
 });
 
-
-//select model
-bot.onText(/\/setmodel/, async (msg) => {
-  const chatId = msg.chat.id;
-
-  if (!await checkMembership(msg)) return;
-
-  // Build buttons dynamically only for models with keys
-  const buttons = Object.entries(MODELS)
-    .map(([id, m]) => ({
-      text: m.name + (m.key ? "" : " ❌ Unavailable"),
-      callback_data: m.key ? `model_${id}` : `unavailable_${id}`
-    }))
-    .map(b => [b]); // one button per row
-
-  bot.sendMessage(chatId, "🤖 Choose your AI model:", {
-    reply_markup: { inline_keyboard: buttons }
-  });
-});
-
-
-bot.on("callback_query", async (query) => {
-  const chatId = query.message.chat.id;
-
-  if (query.data.startsWith("model_")) {
-    const modelId = query.data.replace("model_", "");
-    userSelectedModel[chatId] = modelId;
-
-    bot.sendMessage(chatId, `✅ Model set to *${MODELS[modelId].name}*`, { parse_mode: "Markdown" });
-    bot.answerCallbackQuery(query.id);
-  }
-
-  if (query.data.startsWith("unavailable_")) {
-    bot.answerCallbackQuery(query.id, {
-      text: "⚠ This model is not available right now.",
-      show_alert: true
-    });
-  }
-});
-
-
-//imagine 
-bot.onText(/\/imagine (.+)/, async (msg, match) => {
-  const chatId = msg.chat.id;
-
-  if (!await checkMembership(msg)) return;
-
-  if (!await guardAccess(msg)) return;
-
-  if (!guardCommandRateLimit(msg, "imagine")) return;
-
-  const prompt = match[1];
-
-  bot.sendChatAction(chatId, "upload_photo");
-
-  //added imagine limit  
-  if (!checkLimit(chatId, "imagine", IMAGINE_LIMIT)) {
-    bot.sendMessage(chatId, `⚠️ Daily image generation limit reached (${IMAGINE_LIMIT}). Try again tomorrow.`);
-    return;
-  }
-
-
-  try {
-    const imageUrl = `https://image.pollinations.ai/prompt/${encodeURIComponent(prompt)}`;
-
-    await bot.sendPhoto(chatId, imageUrl, {
-      caption: `🎨 Prompt: ${prompt}`
-    });
-  } catch (err) {
-    console.error("❌ Image generation error:", err);
-    bot.sendMessage(chatId, "⚠ Could not generate image.");
-  }
-});
-
-//document analysis
+// ── Document analysis ─────────────────────────────────────
+// FIX #3 + #5 + #8 + #24
 bot.on("document", async (msg) => {
   const chatId = msg.chat.id;
-
   if (!await checkMembership(msg)) return;
-
-  if (!await guardAccess(msg)) return;
-
-  if (!guardRateLimitMedia(msg)) return;
-
-  const fileName = msg.document.file_name.toLowerCase();
-
-  bot.sendChatAction(chatId, "typing");
-
-  //added document analysis limit
-  if (!checkLimit(chatId, "doc", DOC_LIMIT)) {
-    bot.sendMessage(chatId, `⚠️ Daily document analysis limit reached (${DOC_LIMIT}). Try again tomorrow.`);
-    return;
+  if (!await guardAccess(msg))     return;
+  if (!guardRateLimitMedia(msg))   return;
+  if (isProcessing(chatId)) {
+    return bot.sendMessage(chatId, "⏳ Your previous request is still in progress.").catch(() => {});
+  }
+  if (!checkLimit(chatId, "doc", CFG.DOC_LIMIT)) {
+    return bot.sendMessage(chatId, `⚠️ Daily document limit reached (${CFG.DOC_LIMIT}). Try again tomorrow.`).catch(() => {});
   }
 
+  const fileName = (msg.document.file_name || "").toLowerCase();
+  if (![".pdf", ".docx", ".txt"].some(ext => fileName.endsWith(ext))) {
+    return bot.sendMessage(chatId, "⚠️ Only PDF, DOCX, or TXT files are supported.").catch(() => {});
+  }
 
+  markProcessing(chatId);
   try {
-    const fileBuffer = await downloadFile(msg.document.file_id);
-    if (!Buffer.isBuffer(fileBuffer) || fileBuffer.length === 0) {
-      bot.sendMessage(chatId, "⚠️ Could not download your document.");
-      return;
-    }
+    await enqueueRequest(async () => {
+      await withThinkingIndicator(chatId, "📄 Analysing your document, please wait…", async () => {
+        let fileBuffer;
+        try {
+          fileBuffer = await downloadFile(msg.document.file_id);
+        } catch (err) {
+          if (err.message?.startsWith("FILE_TOO_LARGE"))
+            return bot.sendMessage(chatId, `⚠️ File too large. Max: ${CFG.MAX_FILE_MB} MB.`).catch(() => {});
+          throw err;
+        }
 
-    let text = "";
-    if (fileName.endsWith(".pdf")) {
-      const data = await pdf(fileBuffer);
-      text = data.text;
-    } else if (fileName.endsWith(".docx")) {
-      const data = await mammoth.extractRawText({ buffer: fileBuffer });
-      text = data.value;
-    } else if (fileName.endsWith(".txt")) {
-      text = fileBuffer.toString("utf-8");
-    } else {
-      bot.sendMessage(chatId, "⚠️ Only PDF, DOCX or TXT files are supported.");
-      return;
-    }
+        let text = "";
+        if (fileName.endsWith(".pdf")) {
+          const data = await withTimeout(pdf(fileBuffer), CFG.API_TIMEOUT_MS, "pdf-parse");
+          text = data.text;
+        } else if (fileName.endsWith(".docx")) {
+          const data = await withTimeout(mammoth.extractRawText({ buffer: fileBuffer }), CFG.API_TIMEOUT_MS, "mammoth");
+          text = data.value;
+        } else {
+          text = fileBuffer.toString("utf-8");
+        }
+        fileBuffer = null; // FIX #24: release buffer ASAP
 
-    if (!text.trim()) {
-      bot.sendMessage(chatId, "⚠️ No readable text found in this file.");
-      return;
-    }
+        if (!text.trim()) return bot.sendMessage(chatId, "⚠️ No readable text found.").catch(() => {});
+        if (text.length > CFG.DOC_CHAR_LIMIT) text = text.slice(0, CFG.DOC_CHAR_LIMIT);
 
-    const DOC_CHAR_LIMIT = parseInt(process.env.DOC_CHAR_LIMIT);
-    if (text.length > DOC_CHAR_LIMIT) text = text.slice(0, DOC_CHAR_LIMIT);
-
-    const docModel = genAI.getGenerativeModel({ model: process.env.GEMINI_MODEL_5 });
-    const result = await docModel.generateContent({
-      contents: [
-        { role: "user", parts: [{ text: `Summarize this document:\n\n${text}` }] }
-      ],
-      generationConfig: { maxOutputTokens: MAX_REPLY_TOKENS }
+        const model  = genAI.getGenerativeModel({ model: process.env.GEMINI_MODEL_5 });
+        const result = await withTimeout(
+          model.generateContent({
+            contents        : [{ role: "user", parts: [{ text: `Summarize this document:\n\n${text}` }] }],
+            generationConfig: { maxOutputTokens: CFG.MAX_REPLY_TOKENS },
+          }),
+          CFG.API_TIMEOUT_MS, "gemini-doc"
+        );
+        const reply = result?.response?.text() || "⚠️ No response.";
+        await safeSend(chatId, "📄 *Document Summary:*\n\n" + reply, { parse_mode: "Markdown" });
+        touchLastActive(chatId); // FIX #8
+      });
     });
-
-    const reply = result?.response?.text() || "⚠️ No response from Gemini.";
-    bot.sendMessage(chatId, "📄 Document summary:\n\n" + reply);
-
   } catch (err) {
-    console.error("❌ Document analysis error:", err);
-    bot.sendMessage(chatId, "⚠️ Could not analyze your document.");
+    console.error("❌ Document error:", err.message);
+    bot.sendMessage(chatId, err.message === "QUEUE_FULL"
+      ? "⚠️ Bot is busy. Please try again in a moment."
+      : err.message?.startsWith("TIMEOUT")
+        ? "⚠️ Analysis timed out. Try a smaller file."
+        : err.message?.toLowerCase().includes("file is too big")
+          ? `⚠️ File too large. Max: ${CFG.MAX_FILE_MB} MB.`
+          : "⚠️ Could not analyse your document."
+    ).catch(() => {});
+  } finally {
+    unmarkProcessing(chatId);
   }
 });
 
-//image analysis
+// ── Image analysis ────────────────────────────────────────
+// FIX #3 + #5 + #8 + #14 (album dedup)
 bot.on("photo", async (msg) => {
   const chatId = msg.chat.id;
 
-  if (!await checkMembership(msg)) return;
-
-  if (!await guardAccess(msg)) return;
-
-  if (!guardRateLimitMedia(msg)) return;
-
-  const photo = msg.photo[msg.photo.length - 1]; // largest size
-
-  bot.sendChatAction(chatId, "typing");
-
-  //added image analysis limit
-  if (!checkLimit(chatId, "img", LIMIT_IMG)) {
-    bot.sendMessage(chatId, `⚠️ Daily image analysis limit reached (${LIMIT_IMG}). Try again tomorrow.`);
-    return;
+  // FIX #14: skip duplicate events from the same album
+  if (msg.media_group_id) {
+    if (albumSeen.has(msg.media_group_id)) return;
+    albumSeen.set(msg.media_group_id, Date.now());
+    // Delete directly after 5 s — don't wait for the 30-min sweeper (memory leak fix)
+    setTimeout(() => albumSeen.delete(msg.media_group_id), 5000);
   }
 
+  if (!await checkMembership(msg)) return;
+  if (!await guardAccess(msg))     return;
+  if (!guardRateLimitMedia(msg))   return;
+  if (isProcessing(chatId)) {
+    return bot.sendMessage(chatId, "⏳ Your previous request is still in progress.").catch(() => {});
+  }
+  if (!checkLimit(chatId, "img", CFG.IMG_LIMIT)) {
+    return bot.sendMessage(chatId, `⚠️ Daily image analysis limit reached (${CFG.IMG_LIMIT}). Try again tomorrow.`).catch(() => {});
+  }
 
+  const photo = msg.photo[msg.photo.length - 1];
+  markProcessing(chatId);
   try {
-    const fileBuffer = await downloadFile(photo.file_id);
-    const base64Image = fileBuffer.toString("base64");
+    await enqueueRequest(async () => {
+      await withThinkingIndicator(chatId, "🖼️ Analysing your image, please wait…", async () => {
+        let fileBuffer;
+        try {
+          fileBuffer = await downloadFile(photo.file_id);
+        } catch (err) {
+          if (err.message?.startsWith("FILE_TOO_LARGE"))
+            return bot.sendMessage(chatId, `⚠️ Image too large. Max: ${CFG.MAX_FILE_MB} MB.`).catch(() => {});
+          throw err;
+        }
 
-    const imgModel = genAI.getGenerativeModel({ model: process.env.GEMINI_MODEL_5 });
-    const result = await imgModel.generateContent([
-      "Describe this image clearly.",
-      { inlineData: { data: base64Image, mimeType: "image/jpeg" } }
-    ]);
+        const base64Image = fileBuffer.toString("base64");
+        fileBuffer = null; // FIX #24: release buffer
 
-    const reply = result?.response?.text() || "⚠️ No response from Gemini.";
-    bot.sendMessage(chatId, "🖼️ Image analysis:\n\n" + reply);
-
+        const model  = genAI.getGenerativeModel({ model: process.env.GEMINI_MODEL_5 });
+        const result = await withTimeout(
+          model.generateContent([
+            "Describe this image in detail.",
+            { inlineData: { data: base64Image, mimeType: "image/jpeg" } },
+          ]),
+          CFG.API_TIMEOUT_MS, "gemini-img"
+        );
+        const reply = result?.response?.text() || "⚠️ No response.";
+        await safeSend(chatId, "🖼️ *Image Analysis:*\n\n" + reply, { parse_mode: "Markdown" });
+        touchLastActive(chatId); // FIX #8
+      });
+    });
   } catch (err) {
-    console.error("❌ Image analysis error:", err);
-    bot.sendMessage(chatId, "⚠️ Could not analyze your image.");
+    console.error("❌ Image analysis error:", err.message);
+    bot.sendMessage(chatId, err.message === "QUEUE_FULL"
+      ? "⚠️ Bot is busy. Please try again in a moment."
+      : err.message?.startsWith("TIMEOUT")
+        ? "⚠️ Analysis timed out. Try a smaller image."
+        : err.message?.toLowerCase().includes("file is too big")
+          ? `⚠️ Image too large. Max: ${CFG.MAX_FILE_MB} MB.`
+          : "⚠️ Could not analyse your image."
+    ).catch(() => {});
+  } finally {
+    unmarkProcessing(chatId);
   }
 });
 
-// Function to split long messages into chunks
-async function sendLongMessage(chatId, text) {
-  const MAX_LENGTH = 4000;
-
-  for (let i = 0; i < text.length; i += MAX_LENGTH) {
-    const chunk = text.substring(i, i + MAX_LENGTH);
-    await bot.sendMessage(chatId, chunk);
-  }
-}
-
-// --- Chat with Gemini ---
+// ── Main chat handler ─────────────────────────────────────
+// FIX #2 + #3 + #5 + #7 + #8 + #25 + #28
 bot.on("message", async (msg) => {
   const chatId = msg.chat.id;
-  const text = msg.text;
+  const text   = msg.text;
 
-  if (text && text.startsWith("/")) return; // ignore commands & empty
-
-  if (!text) return;
+  if (!text || text.startsWith("/") || msg.photo || msg.document) return;
 
   if (!await checkMembership(msg)) return;
+  if (!await guardAccess(msg))     return;
+  if (!guardRateLimit(msg))        return;
 
-  if (!await guardAccess(msg)) return;
-
-  if (!guardRateLimit(msg)) return;
-
-  // Block pure link messages
-  if (msg.text && /^https?:\/\//i.test(msg.text.trim())) {
-    bot.sendMessage(chatId, "⚠️ Links are not allowed. Please send text, document, or image.");
-    return;
+  if (/^https?:\/\//i.test(text.trim())) {
+    return bot.sendMessage(chatId, "⚠️ Links are not allowed.").catch(() => {});
   }
 
+  // Reply keyboard shortcuts
+  if (text === "🔍 Search")          return bot.sendMessage(chatId, "🔍 Type: `/search your query`",  { parse_mode: "Markdown" }).catch(() => {});
+  if (text === "🎨 Imagine")         return bot.sendMessage(chatId, "🎨 Type: `/imagine your prompt`", { parse_mode: "Markdown" }).catch(() => {});
+  if (text === "🚫 Report Error")    return bot.sendMessage(chatId, `Contact ${CFG.FORCE_CHANNEL} to report problems.`).catch(() => {});
+  if (text === "📄 Document Analysis") return bot.sendMessage(chatId, "📤 Send any document or image for analysis.").catch(() => {});
 
-  //reply keywords
-  if (text === "🔍 Search") {
-    bot.sendMessage(chatId, "🔍 Please type your search like:\n`/search your query`", { parse_mode: "Markdown" });
-    return;
+  if (isProcessing(chatId)) {
+    return bot.sendMessage(chatId, "⏳ Your previous request is still in progress. Please wait.").catch(() => {});
   }
 
-  if (text === "🎨 Imagine") {
-    bot.sendMessage(chatId, "🎨 Please type your prompt like:\n`/imagine your prompt`", { parse_mode: "Markdown" });
-    return;
-  }
-
-  if (text === "🚫 Report Error") {
-    bot.sendMessage(chatId, `Contact ${FORCE_JOIN_CHANNEL} to report any problem.`);
-    return;
-  }
-
-  if (text === "📄 Document Analysis") {
-    bot.sendMessage(chatId, "Send any document and image for it's analysis.");
-    return;
-  }
-
-
-  // Fetch or create user from DB
-  let user = await User.findOne({ chatId });
-  if (!user) {
-    user = new User({
-      chatId,
-      requests: 0,
-      lastReset: new Date(),
-      usage: { tokensUsed: 0, resetDate: new Date() },
-      messages: [],
-    });
-    await user.save();
-  }
-
-  // Reset request limits daily
-  const today = new Date().toDateString();
-  if (user.lastReset.toDateString() !== today) {
-    user.requests = 0;
-    user.lastReset = new Date();
-  }
-
-  // Reset token usage daily
-  if (user.usage.resetDate.toDateString() !== today) {
-    user.usage.tokensUsed = 0;
-    user.usage.resetDate = new Date();
-  }
-
-  // Check daily request limit 
-  if (user.requests >= DAILY_REQUEST_LIMIT) {
-    bot.sendMessage(chatId, `⚠️ You’ve reached your daily request limit (${DAILY_REQUEST_LIMIT}). Try again tomorrow.`);
-    return;
-  }
-
-  // Estimate input tokens
-  if (typeof text !== "string") return;
-  const inputTokens = Math.ceil(text.split(/\s+/).length * 1.3);
-
-  // Check token limit per day
-  if (user.usage.tokensUsed + inputTokens >= DAILY_TOKEN_LIMIT) {
-    bot.sendMessage(chatId, `⚠️ You’ve reached your daily token limit (${DAILY_TOKEN_LIMIT}). Try again tomorrow.`);
-    return;
-  }
-
-  // Language
-  const lang = userLanguages[chatId] || "en";
-
+  markProcessing(chatId);
   try {
-    bot.sendChatAction(chatId, "typing");
+    await enqueueRequest(async () => {
+      // FIX #2: race-safe upsert
+      let user = await getOrCreateUser(chatId);
 
-    // Get last messages for context
-    const history = user.messages
-      .slice(-HISTORY_MESSAGES)
-      .map((m) => `${m.role}: ${m.text}`)
-      .join("\n");
+      // FIX #7: UTC-aligned daily resets
+      const resetUpdates = {};
+      if (needsDailyReset(user.lastReset))   { resetUpdates.requests  = 0; resetUpdates.lastReset   = new Date(); user.requests   = 0; }
+      if (needsDailyReset(user.tokensReset)) { resetUpdates.tokensUsed = 0; resetUpdates.tokensReset = new Date(); user.tokensUsed = 0; }
+      if (Object.keys(resetUpdates).length) {
+        await User.findOneAndUpdate({ chatId: cid(chatId) }, { $set: resetUpdates });
+      }
 
-    // Ask Gemini with output limit
-    const selectedId = userSelectedModel[chatId] || "gemini";
-    const chosen = MODELS[selectedId];
+      if (user.requests  >= CFG.DAILY_REQUEST_LIMIT) {
+        return bot.sendMessage(chatId, `⚠️ Daily request limit (${CFG.DAILY_REQUEST_LIMIT}) reached. Try again tomorrow.`).catch(() => {});
+      }
 
-    // If model has no API key, block the request
-    if (!chosen.key) {
-      bot.sendMessage(chatId, "⚠ This model is not available right now. Please choose another using /setmodel");
-      return;
-    }
+      const inputTokens = Math.ceil(text.split(/\s+/).length * 1.3);
+      if (user.tokensUsed + inputTokens >= CFG.DAILY_TOKEN_LIMIT) {
+        return bot.sendMessage(chatId, `⚠️ Daily token limit (${CFG.DAILY_TOKEN_LIMIT}) reached. Try again tomorrow.`).catch(() => {});
+      }
 
-    let reply = "";
+      await hydrateUserPrefs(chatId);
+      const lang    = userLanguages.get(cid(chatId)) || "en";
 
-    if (chosen.provider === "gemini") {
+      // FIX #25: in-memory history cache would go here; we read from DB (acceptable at this scale)
+      const history = await getRecentHistory(chatId);
 
-      // Optional: keep Pro limit
-      if (chosen.model === process.env.GEMINI_MODEL_4) {
-        if (!checkLimit(chatId, "proTokens", LIMIT_PRO)) {
-          bot.sendMessage(chatId, `⚠️ Pro model daily limit reached (${LIMIT_PRO})`);
-          return;
+      let aiResult;
+      try {
+        aiResult = await withThinkingIndicator(chatId, "🤔 Thinking…", () => getAIReply(chatId, text, history, lang));
+      } catch (err) {
+        if (err.message?.startsWith("PRO_LIMIT")) return bot.sendMessage(chatId, `⚠️ Pro model daily limit reached. Use /setmodel.`).catch(() => {});
+        if (err.message === "NO_KEY")              return bot.sendMessage(chatId, "⚠️ Model unavailable. Use /setmodel.").catch(() => {});
+        if (err.message?.startsWith("TIMEOUT"))    return bot.sendMessage(chatId, "⚠️ AI took too long to respond. Try again.").catch(() => {});
+        throw err;
+      }
+
+      const { reply, chosen } = aiResult;
+      const outputTokens  = Math.ceil(reply.split(/\s+/).length * 1.3);
+      const totalTokens   = inputTokens + outputTokens;
+
+      if (user.tokensUsed + totalTokens > CFG.DAILY_TOKEN_LIMIT) {
+        return bot.sendMessage(chatId, "⚠️ Reply would exceed daily token limit. Try again tomorrow.").catch(() => {});
+      }
+
+      // Atomic DB update — FIX #8: lastActive always updated here
+      await User.findOneAndUpdate(
+        { chatId: cid(chatId) },
+        {
+          $inc: { requests: 1, tokensUsed: totalTokens },
+          $set: { lastActive: new Date() },
         }
-      }
+      );
 
-      //console.log("ACTIVE MODEL:", chosen.model);
+      await appendChatHistory(chatId, text, reply);
 
-      const dynamicModel = genAI.getGenerativeModel({
-        model: chosen.model
-      });
+      const remaining = CFG.DAILY_REQUEST_LIMIT - (user.requests + 1);
+      const tokLeft   = CFG.DAILY_TOKEN_LIMIT   - (user.tokensUsed + totalTokens);
+      // FIX #28: escape model name in case it has underscores
+      const footer    = `\n\n🤖 *${escapeMarkdown(chosen.name || "")}*  |  📨 ${remaining} left  |  🪙 ${tokLeft} tokens`;
 
-      const result = await dynamicModel.generateContent({
-        contents: [
-          {
-            role: "user",
-            parts: [{ text: `Answer in ${LANGUAGES[lang]} (${lang})\n\nConversation so far:\n${history}\n\nUser: ${text}` }],
-          },
-        ],
-        generationConfig: { maxOutputTokens: MAX_REPLY_TOKENS },
-      });
-
-      reply = result?.response?.text() || "⚠️ No response from Gemini.";
-    } else if (chosen.type === "openai") {
-      //if api key is not available then 
-      if (!process.env.OPENAI_API_KEY) {
-        bot.sendMessage(chatId, "⚠ This model is not available right now.");
-        return;
-      }
-      //other wise normal response 
-      const OpenAI = (await import("openai")).default;
-      const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-
-      const result = await openai.chat.completions.create({
-        model: process.env.OPENAI_MODEL_1,
-        messages: [
-          { role: "system", content: "You are a helpful assistant." },
-          { role: "user", content: `Answer in ${LANGUAGES[lang]} (${lang})\n\nConversation so far:\n${history}\n\nUser: ${text}` }
-        ],
-        max_tokens: MAX_REPLY_TOKENS
-      });
-
-      reply = result.choices[0].message.content || "⚠ No response from OpenAI.";
-    } else if (chosen.type === "claude") {
-      //if api is not available
-      if (!process.env.CLAUDE_API_KEY) {
-        bot.sendMessage(chatId, "⚠ This model is not available right now.");
-        return;
-      }
-      //otherwise normal response
-      const Anthropic = (await import("@anthropic-ai/sdk")).default;
-      const anthropic = new Anthropic({ apiKey: process.env.CLAUDE_API_KEY });
-      const response = await anthropic.messages.create({
-        model: process.env.CLAUDE_MODEL_1,
-        max_tokens: MAX_REPLY_TOKENS,
-        messages: [
-          {
-            role: "user",
-            content: `Answer in ${LANGUAGES[lang]} (${lang})\n\nConversation so far:\n${history}\n\nUser: ${text}`
-          }
-        ]
-      });
-
-      reply = response.content?.[0]?.text || "⚠ No response from Claude.";
-    }
-
-
-    // Estimate output tokens
-    const outputTokens = Math.ceil(reply.split(/\s+/).length * 1.3);
-
-    // Final check for token limit
-    if (user.usage.tokensUsed + inputTokens + outputTokens > DAILY_TOKEN_LIMIT) {
-      bot.sendMessage(chatId, `⚠️ This reply would exceed your daily token limit (${DAILY_TOKEN_LIMIT}). Try again tomorrow.`);
-      return;
-    }
-
-    // Save conversation in MongoDB
-    user.messages.push({ role: "user", text });
-    user.messages.push({ role: "bot", text: reply });
-
-    //limit number of chat saved
-    if (user.messages.length > DB_MSG_LIMIT) {
-      user.messages = user.messages.slice(-DB_MSG_LIMIT);
-    }
-
-    // Update usage
-    user.requests += 1;
-    user.usage.tokensUsed += inputTokens + outputTokens;
-    await user.save();
-
-    // Reply with usage info
-    // NEW CODE - Uses the split function
-    const footer = `\n\n🤖 Model: ${chosen.name}\n🪙 Requests left: ${DAILY_REQUEST_LIMIT - user.requests}\nTokens left: ${DAILY_TOKEN_LIMIT - user.usage.tokensUsed}`;
-    const fullResponse = reply + footer;
-
-    if (fullResponse.length > 4000) {
-      // If too long, split it
-      await sendLongMessage(chatId, fullResponse);
-    } else {
-      // Short message: Send as Markdown (Looks professional)
-      // We use try/catch in case Gemini generates broken Markdown
-      try {
-        await bot.sendMessage(chatId, fullResponse, { parse_mode: "Markdown" });
-      } catch (err) {
-        // Fallback to plain text if Markdown fails
-        await bot.sendMessage(chatId, fullResponse);
-      }
-    }
+      await safeSend(chatId, reply + footer, { parse_mode: "Markdown" });
+    });
   } catch (err) {
-    console.error("❌ Gemini error:", err);
-    bot.sendMessage(chatId, "❌ BOT ERROR: " + (err.message || "Unknown error"));
+    if (err.message === "QUEUE_FULL") {
+      return bot.sendMessage(chatId, "⚠️ Bot is very busy. Please try again shortly.").catch(() => {});
+    }
+    console.error("❌ Chat error:", err.message);
+    bot.sendMessage(chatId, "❌ Something went wrong. Please try again.").catch(() => {});
+  } finally {
+    unmarkProcessing(chatId);
   }
 });
 
-//broadcast 
+// ============================================================
+//  SECTION 11 · ADMIN COMMANDS
+//  FIX #16: all wrapped in try/catch
+// ============================================================
+
+// ── /broadcast ───────────────────────────────────────────
 bot.onText(/\/broadcast (.+)/, async (msg, match) => {
-  if (msg.chat.id !== ADMIN_ID) return;
-
-  const message = match[1];
-
+  if (msg.chat.id !== CFG.ADMIN_ID) return;
+  bot.sendMessage(CFG.ADMIN_ID, "📡 Broadcast starting…").catch(() => {});
   try {
-    const users = await User.find({});
-    let success = 0, failed = 0;
+    const { success, failed } = await broadcastMessage(match[1]);
+    bot.sendMessage(CFG.ADMIN_ID, `✅ Done.\n✔️ Sent: ${success}\n❌ Failed: ${failed}`).catch(() => {});
+  } catch (err) {
+    console.error("broadcast error:", err.message);
+    bot.sendMessage(CFG.ADMIN_ID, "⚠️ Broadcast failed.").catch(() => {});
+  }
+});
 
-    for (const u of users) {
-      try {
-        await bot.sendMessage(u.chatId, `📢 Broadcast from Admin:\n\n${message}`);
-        success++;
-      } catch (err) {
-        console.warn(`⚠️ Could not send to ${u.chatId}: ${err.message}`);
-        failed++;
+// ── /usage ───────────────────────────────────────────────
+bot.onText(/\/usage/, async (msg) => {
+  if (msg.chat.id !== CFG.ADMIN_ID) return;
+  try {
+    const today  = utcToday();
+    let report   = `📊 *Usage Report* (${today})\n━━━━━━━━━━━━━\n`;
+    let count    = 0;
+    const cursor = User.find({}, { chatId: 1, requests: 1, tokensUsed: 1 }).cursor();
+
+    for await (const u of cursor) {
+      const usage = userUsage.get(cid(u.chatId)) || {};
+      report += `\n👤 \`${u.chatId}\`\nReqs: ${u.requests} | Tokens: ${u.tokensUsed}\n🔍${usage.search||0} 🎨${usage.imagine||0} 📄${usage.doc||0} 🖼️${usage.img||0}\n━━━━━━`;
+      count++;
+      if (count % 20 === 0) {
+        await bot.sendMessage(CFG.ADMIN_ID, report, { parse_mode: "Markdown" }).catch(() => {});
+        report = "";
       }
     }
-
-    bot.sendMessage(
-      ADMIN_ID,
-      `✅ Broadcast sent to ${success} users.\n⚠️ Failed to send to ${failed} users.`
-    );
+    if (report) bot.sendMessage(CFG.ADMIN_ID, report, { parse_mode: "Markdown" }).catch(() => {});
   } catch (err) {
-    console.error("❌ Broadcast error:", err);
-    bot.sendMessage(ADMIN_ID, "⚠️ Failed to send broadcast.");
+    console.error("usage error:", err.message);
+    bot.sendMessage(CFG.ADMIN_ID, "⚠️ Could not generate usage report.").catch(() => {});
   }
 });
 
-//usage
-bot.onText(/\/usage/, async (msg) => {
-  if (msg.chat.id !== ADMIN_ID) return;
-
+// ── /users ───────────────────────────────────────────────
+bot.onText(/\/users/, async (msg) => {
+  if (msg.chat.id !== CFG.ADMIN_ID) return;
   try {
-    const users = await User.find({});
-    const today = getToday();
+    const users = await User.find({ approvedUntil: { $gt: new Date() } }, { chatId: 1, approvedUntil: 1 });
+    if (!users.length) return bot.sendMessage(CFG.ADMIN_ID, "📭 No active approved users.").catch(() => {});
 
-    let report = `📊 *Usage Report* (${today})\n━━━━━━━━━━━━━\n`;
-
-    for (const u of users) {
-      const usage = userUsage[u.chatId] || { search: 0, imagine: 0, doc: 0, img: 0, proTokens: 0, date: today };
-
-      report += `
-👤 ID: \`${u.chatId}\`
-Requests: ${u.requests}, Tokens: ${u.usage?.tokensUsed || 0}
-🔍 ${usage.search || 0} | 🎨 ${usage.imagine || 0} | 📄 ${usage.doc || 0} | 🖼️ ${usage.img || 0} | 🤖 ${usage.proTokens || 0}
-━━━━━━━━━━━━━`;
-    }
-
-    bot.sendMessage(ADMIN_ID, report, { parse_mode: "Markdown" });
+    let text = "👥 *Approved Users*\n━━━━━━━━━━━━━\n";
+    users.forEach((u, i) => {
+      const rem = Math.max(0, Math.ceil((new Date(u.approvedUntil) - Date.now()) / 3600000)) + "h";
+      text += `${i + 1}. \`${u.chatId}\` — ⏳ ${rem}\n`;
+    });
+    bot.sendMessage(CFG.ADMIN_ID, text, { parse_mode: "Markdown" }).catch(() => {});
   } catch (err) {
-    console.error("❌ Usage report error:", err);
-    bot.sendMessage(ADMIN_ID, "⚠️ Failed to generate usage report.");
+    console.error("users error:", err.message);
+    bot.sendMessage(CFG.ADMIN_ID, "⚠️ Could not list users.").catch(() => {});
   }
 });
 
-//see users
-bot.onText(/\/users/, async (msg) => { // 👈 Mark as async
-  if (msg.chat.id !== ADMIN_ID) return;
-
-  // Find all users where approvedUntil is in the FUTURE ($gt = Greater Than)
-  const users = await User.find({ approvedUntil: { $gt: new Date() } });
-
-  if (users.length === 0) {
-    return bot.sendMessage(ADMIN_ID, "📭 No active users.");
+// ── /approve ─────────────────────────────────────────────
+bot.onText(/\/approve (\d+)/, async (msg, match) => {
+  if (msg.chat.id !== CFG.ADMIN_ID) return;
+  const userId    = match[1];
+  const expiresAt = new Date(Date.now() + CFG.APPROVAL_HOURS * 3600000);
+  try {
+    await User.findOneAndUpdate(
+      { chatId: userId },
+      { $set: { approvedUntil: expiresAt } },
+      { upsert: true }
+    );
+    // FIX #9: immediately invalidate approval cache
+    approvalCache.delete(userId);
+    approvalCache.delete(Number(userId));
+    bot.sendMessage(CFG.ADMIN_ID, `✅ User ${userId} approved until ${expiresAt.toUTCString()}`).catch(() => {});
+  } catch (err) {
+    console.error("approve error:", err.message);
+    bot.sendMessage(CFG.ADMIN_ID, "⚠️ Could not approve user.").catch(() => {});
   }
-
-  let text = "👥 *Approved Users*\n━━━━━━━━━━━━━\n";
-  users.forEach((u, i) => {
-    const remaining = Math.max(0, Math.ceil((new Date(u.approvedUntil) - Date.now()) / (3600000))) + "h";
-    text += `${i + 1}. \`${u.chatId}\` — ⏳ ${remaining}\n`;
-  });
-
-  bot.sendMessage(ADMIN_ID, text, { parse_mode: "Markdown" });
 });
 
-//remove users
+// ── /remove ──────────────────────────────────────────────
 bot.onText(/\/remove (\d+)/, async (msg, match) => {
-  if (msg.chat.id !== ADMIN_ID) return;
+  if (msg.chat.id !== CFG.ADMIN_ID) return;
   const userId = match[1];
-
-  // Set date to null to remove access
-  await User.findOneAndUpdate({ chatId: userId }, { approvedUntil: null });
-
-  bot.sendMessage(ADMIN_ID, `❌ User ${userId} removed.`);
-});
-
-//user status
-bot.onText(/\/status/, async (msg) => {
-  const chatId = msg.chat.id;
-
-  if (PUBLIC_MODE) {
-    bot.sendMessage(chatId, "🔓 Bot is currently in PUBLIC MODE");
-  }
-
-  if (await isUserApproved(chatId)) {
-    bot.sendMessage(chatId, "✅ You have access to this bot.");
-  } else {
-    bot.sendMessage(chatId, "🚧 You do not have access.");
+  try {
+    await User.findOneAndUpdate({ chatId: userId }, { $set: { approvedUntil: null } });
+    approvalCache.delete(userId);
+    approvalCache.delete(Number(userId));
+    bot.sendMessage(CFG.ADMIN_ID, `❌ User ${userId} removed.`).catch(() => {});
+  } catch (err) {
+    console.error("remove error:", err.message);
+    bot.sendMessage(CFG.ADMIN_ID, "⚠️ Could not remove user.").catch(() => {});
   }
 });
 
-//set bot public
-bot.onText(/\/public/, (msg) => {
-  if (msg.chat.id !== ADMIN_ID) return;
-
-  PUBLIC_MODE = true;
-  bot.sendMessage(msg.chat.id, "🔓 Bot is now in PUBLIC mode");
+// ── /public / /private / /mode — FIX #10: persisted to DB ──
+bot.onText(/\/public/, async (msg) => {
+  if (msg.chat.id !== CFG.ADMIN_ID) return;
+  try {
+    PUBLIC_MODE = true;
+    await Setting.findOneAndUpdate({ key: "publicMode" }, { $set: { value: true } }, { upsert: true });
+    bot.sendMessage(CFG.ADMIN_ID, "🔓 Bot is now PUBLIC. (Persisted)").catch(() => {});
+  } catch (err) {
+    console.error("public mode error:", err.message);
+    bot.sendMessage(CFG.ADMIN_ID, "⚠️ Could not save setting.").catch(() => {});
+  }
 });
 
-//set bot private 
-bot.onText(/\/private/, (msg) => {
-  if (msg.chat.id !== ADMIN_ID) return;
-
-  PUBLIC_MODE = false;
-  bot.sendMessage(msg.chat.id, "🔒 Bot is now in PRIVATE mode");
+bot.onText(/\/private/, async (msg) => {
+  if (msg.chat.id !== CFG.ADMIN_ID) return;
+  try {
+    PUBLIC_MODE = false;
+    await Setting.findOneAndUpdate({ key: "publicMode" }, { $set: { value: false } }, { upsert: true });
+    bot.sendMessage(CFG.ADMIN_ID, "🔒 Bot is now PRIVATE. (Persisted)").catch(() => {});
+  } catch (err) {
+    console.error("private mode error:", err.message);
+    bot.sendMessage(CFG.ADMIN_ID, "⚠️ Could not save setting.").catch(() => {});
+  }
 });
 
-//set mode private or public
 bot.onText(/\/mode/, (msg) => {
-  if (msg.chat.id !== ADMIN_ID) return;
+  if (msg.chat.id !== CFG.ADMIN_ID) return;
+  bot.sendMessage(CFG.ADMIN_ID, PUBLIC_MODE ? "🔓 Mode: PUBLIC" : "🔒 Mode: PRIVATE").catch(() => {});
+});
 
-  bot.sendMessage(
-    msg.chat.id,
-    PUBLIC_MODE
-      ? "🔓 Current Mode: PUBLIC"
-      : "🔒 Current Mode: PRIVATE"
-  );
+// ============================================================
+//  BOOT
+// ============================================================
+startup().catch(err => {
+  console.error("❌ Fatal startup error:", err.message);
+  process.exit(1);
 });

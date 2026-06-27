@@ -46,7 +46,7 @@ const CFG = {
 
   // FIX #8: rate limits — env values in SECONDS, converted to ms here
   RATE_LIMIT_MS      : (Number(process.env.RATE_LIMIT_MS)           || 3)  * 1000,
-  COMMAND_LIMIT_MS   : (Number(process.env.COMMAND_LIMIT_MS)        || 3)  * 1000,
+  COMMAND_LIMIT_MS   : (Number(process.env.COMMAND_LIMIT_MS)        || 5)  * 1000,
   MEDIA_COOLDOWN_MS  : (Number(process.env.LIMIT_MEDIA_COOLDOWN)    || 10) * 1000,
   MAX_FILE_MB        : Number(process.env.MAX_FILE_MB)              || 10,
 
@@ -115,6 +115,34 @@ const settingsSchema = new mongoose.Schema(
 );
 const Setting = mongoose.model("Setting", settingsSchema);
 
+// ── Daily aggregated stats (one document, resets at UTC midnight) ──
+const dailyStatsSchema = new mongoose.Schema(
+  {
+    date     : { type: String, required: true, unique: true }, // "YYYY-MM-DD"
+    tokens   : { type: Number, default: 0 },
+    requests : { type: Number, default: 0 },
+    search   : { type: Number, default: 0 },
+    imagine  : { type: Number, default: 0 },
+    doc      : { type: Number, default: 0 },
+    img      : { type: Number, default: 0 },
+    // TTL field — MongoDB auto-deletes this document 7 days after creation
+    createdAt: { type: Date, default: () => new Date(), index: { expireAfterSeconds: 7 * 86400 } },
+  },
+  { versionKey: false }
+);
+const DailyStats = mongoose.model("DailyStats", dailyStatsSchema);
+
+// Atomically increment one or more fields on today's stats document.
+// Creates the document if it doesn't exist yet (upsert).
+function bumpStats(fields) {
+  const today = utcToday();
+  DailyStats.findOneAndUpdate(
+    { date: today },
+    { $inc: fields },
+    { upsert: true, new: true }
+  ).catch(e => console.error("❌ bumpStats error:", e.message));
+}
+
 const userSchema = new mongoose.Schema(
   {
     // FIX #17: chatId always stored as String — never Number
@@ -131,7 +159,7 @@ const userSchema = new mongoose.Schema(
   },
   { versionKey: false }
 );
-userSchema.index({ chatId: 1 },        { unique: true });
+// chatId unique index is already declared inline in the schema field — no .index() needed here
 userSchema.index({ approvedUntil: 1 });
 userSchema.index({ lastActive: 1 });
 const User = mongoose.model("User", userSchema);
@@ -389,6 +417,10 @@ function checkLimit(chatId, type, limit) {
   }
   if (u[type] >= limit) return false;
   u[type]++;
+  // Persist feature use to daily aggregated stats (search/imagine/doc/img only — not proTokens)
+  if (["search", "imagine", "doc", "img"].includes(type)) {
+    bumpStats({ [type]: 1 });
+  }
   return true;
 }
 
@@ -425,13 +457,13 @@ async function isUserMember(chatId) {
 async function checkMembership(msg) {
   const chatId = msg.chat.id;
   if (await isUserMember(chatId)) return true;
-  bot.sendMessage(chatId, "⚠️ You must join our channel first to use this bot.", {
+  await safeSend(chatId, "⚠️ You must join our channel first to use this bot.", {
     reply_markup: {
       inline_keyboard: [[
         { text: "📢 Join Channel", url: `https://t.me/${CFG.FORCE_CHANNEL.replace("@", "")}` },
       ]],
     },
-  }).catch(() => {});
+  });
   return false;
 }
 
@@ -451,47 +483,47 @@ async function isUserApproved(chatId) {
 
 async function guardAccess(msg) {
   if (await isUserApproved(msg.chat.id)) return true;
-  bot.sendMessage(
+  await safeSend(
     msg.chat.id,
     `🛡️ *Member Only*\nThis feature is locked. Contact ${CFG.FORCE_CHANNEL} to get approved.`,
     { parse_mode: "Markdown" }
-  ).catch(() => {});
+  );
   return false;
 }
 
 // ── Rate limiters ─────────────────────────────────────────
-function guardRateLimit(msg) {
+async function guardRateLimit(msg) {
   if (msg.text?.startsWith("/"))   return true;
   if (msg.photo || msg.document)   return true;
   const key = cid(msg.chat.id);
   const now = Date.now();
   const rem = CFG.RATE_LIMIT_MS - (now - (rateLimitMap.get(key) || 0));
   if (rem > 0) {
-    bot.sendMessage(msg.chat.id, `⏳ Please wait ${Math.ceil(rem / 1000)}s before sending another request.`).catch(() => {});
+    await safeSend(msg.chat.id, `⏳ Please wait ${Math.ceil(rem / 1000)}s before sending another request.`);
     return false;
   }
   rateLimitMap.set(key, now);
   return true;
 }
 
-function guardRateLimitMedia(msg) {
+async function guardRateLimitMedia(msg) {
   const key = cid(msg.chat.id);
   const now = Date.now();
   const rem = CFG.MEDIA_COOLDOWN_MS - (now - (mediaRateLimit.get(key) || 0));
   if (rem > 0) {
-    bot.sendMessage(msg.chat.id, `⏳ Please wait ${Math.ceil(rem / 1000)}s before sending another file.`).catch(() => {});
+    await safeSend(msg.chat.id, `⏳ Please wait ${Math.ceil(rem / 1000)}s before sending another file.`);
     return false;
   }
   mediaRateLimit.set(key, now);
   return true;
 }
 
-function guardCommandRateLimit(msg, commandName) {
+async function guardCommandRateLimit(msg, commandName) {
   const key = `${cid(msg.chat.id)}:${commandName}`;
   const now = Date.now();
   const rem = CFG.COMMAND_LIMIT_MS - (now - (commandRateLmt.get(key) || 0));
   if (rem > 0) {
-    bot.sendMessage(msg.chat.id, `⏳ Please wait ${Math.ceil(rem / 1000)}s before using /${commandName} again.`).catch(() => {});
+    await safeSend(msg.chat.id, `⏳ Please wait ${Math.ceil(rem / 1000)}s before using /${commandName} again.`);
     return false;
   }
   commandRateLmt.set(key, now);
@@ -565,22 +597,59 @@ async function sendLongMessage(chatId, text, opts = {}) {
   }
 }
 
-// ── FIX #18: safeSend only retries on Markdown parse failures ──
+// ── FIX #18 + error handling: safeSend with smart error classification ──
+//
+// Handles the four real failure modes instead of silently swallowing them:
+//   429 → retry once after the retry_after delay Telegram provides
+//   403 → bot blocked/user deleted — remove from DB so we stop wasting cycles
+//   400 "can't parse" → strip parse_mode and retry (Markdown was malformed)
+//   500 / network → log so we know Telegram had an outage; don't crash
 async function safeSend(chatId, text, opts = {}) {
   if (text.length > 4000) return sendLongMessage(chatId, text, opts);
   try {
     return await bot.sendMessage(chatId, text, opts);
   } catch (err) {
-    // Only retry without Markdown — don't retry if bot is blocked/chat deleted
-    // "can't parse" covers Telegram's actual Markdown error ("can't parse entities")
-    // Removed broad "Bad Request" match — it incorrectly caught unrelated 400 errors
-    // (e.g. "file is too big", "chat not found") and triggered an unnecessary retry.
-    const markdownError = err?.message?.includes("can't parse");
-    if (markdownError && opts.parse_mode) {
-      const { parse_mode: _, ...safe } = opts;
-      return bot.sendMessage(chatId, text, safe).catch(() => {});
+    const msg  = err?.message || "";
+    const code = err?.response?.statusCode;
+
+    // 429 — Telegram is rate-limiting us: wait the retry_after it provides, then retry once
+    if (code === 429 || msg.includes("Too Many Requests")) {
+      const retryAfter = (err?.response?.body?.parameters?.retry_after || 5) * 1000;
+      console.warn(`⚠️ Telegram 429 for ${chatId} — retrying after ${retryAfter}ms`);
+      await new Promise(r => setTimeout(r, retryAfter));
+      try { return await bot.sendMessage(chatId, text, opts); }
+      catch (retryErr) { console.error(`❌ safeSend retry failed for ${chatId}:`, retryErr.message); }
+      return;
     }
-    // Otherwise swallow (bot blocked, user left, etc.)
+
+    // 403 — bot was blocked or user deleted their account: clean up DB so we stop processing them
+    if (code === 403 || msg.includes("Forbidden") || msg.includes("bot was blocked")) {
+      console.warn(`⚠️ Bot blocked by ${chatId} — removing from DB`);
+      User.deleteOne({ chatId: cid(chatId) }).catch(e =>
+        console.error("❌ Failed to remove blocked user:", e.message)
+      );
+      ChatHistory.deleteOne({ chatId: cid(chatId) }).catch(e =>
+        console.error("❌ Failed to remove blocked user history:", e.message)
+      );
+      return;
+    }
+
+    // 400 "can't parse entities" — AI generated malformed Markdown: retry as plain text
+    if (msg.includes("can't parse") && opts.parse_mode) {
+      const { parse_mode: _, ...safe } = opts;
+      try { return await bot.sendMessage(chatId, text, safe); }
+      catch (plainErr) { console.error(`❌ safeSend plain-text fallback failed for ${chatId}:`, plainErr.message); }
+      return;
+    }
+
+    // 5xx / network — Telegram outage or dropped connection: log it, don't crash
+    if (code >= 500 || msg.includes("ETIMEOUT") || msg.includes("ECONNRESET") || msg.includes("socket hang up")) {
+      console.error(`❌ Telegram server/network error for ${chatId} (${code || "network"}):`, msg);
+      return;
+    }
+
+    // Everything else (chat not found, user deactivated, etc.) — log so we're not flying blind
+    console.warn(`⚠️ safeSend unhandled error for ${chatId} [${code}]:`, msg);
   }
 }
 
@@ -789,11 +858,11 @@ async function runCleanup() {
 // ── /start ───────────────────────────────────────────────
 bot.onText(/\/start/, async (msg) => {
   if (!await checkMembership(msg)) return;
-  bot.sendMessage(
+  await safeSend(
     msg.chat.id,
     `👋 Hi ${msg.from?.first_name || "there"}!\nI am your Private AI assistant.\nType any question and I'll answer.`,
     mainKeyboard
-  ).catch(() => {});
+  );
 });
 
 // ── /help ────────────────────────────────────────────────
@@ -827,22 +896,22 @@ bot.onText(/\/help/, async (msg) => {
 /private — Set private
 /public — Set public`;
   }
-  bot.sendMessage(chatId, help, { parse_mode: "Markdown" }).catch(() => {});
+  await safeSend(chatId, help, { parse_mode: "Markdown" });
 });
 
 // ── /about ───────────────────────────────────────────────
 bot.onText(/\/about/, async (msg) => {
   if (!await checkMembership(msg)) return;
-  bot.sendMessage(msg.chat.id,
+  await safeSend(msg.chat.id,
     `🤖 *About this bot*\n\nBuilt with:\n• Telegram Bot API\n• Google Gemini\n• OpenAI\n• Claude AI\n• MongoDB Atlas\n• Node.js`,
     { parse_mode: "Markdown" }
-  ).catch(() => {});
+  );
 });
 
 // ── /terms ───────────────────────────────────────────────
 bot.onText(/\/terms/, async (msg) => {
   if (!await checkMembership(msg)) return;
-  bot.sendMessage(msg.chat.id,
+  await safeSend(msg.chat.id,
     `📜 *Terms of Service*\n\n1. Personal & educational use only.\n2. No harmful or illegal content.\n3. Limited usage data stored.\n4. AI responses may not always be accurate.\n5. Using this bot = accepting these terms.`,
     {
       parse_mode: "Markdown",
@@ -851,15 +920,15 @@ bot.onText(/\/terms/, async (msg) => {
         { text: "🔒 Privacy",    url: `${CFG.RENDER_URL}/privacy` },
       ]]},
     }
-  ).catch(() => {});
+  );
 });
 
 // ── /status ──────────────────────────────────────────────
 bot.onText(/\/status/, async (msg) => {
   const chatId = msg.chat.id;
-  if (PUBLIC_MODE) return bot.sendMessage(chatId, "🔓 Bot is in PUBLIC MODE — all users welcome.").catch(() => {});
+  if (PUBLIC_MODE) return safeSend(chatId, "🔓 Bot is in PUBLIC MODE — all users welcome.");
   const approved = await isUserApproved(chatId);
-  bot.sendMessage(chatId, approved ? "✅ You have access." : "🚧 You do not have access yet.").catch(() => {});
+  await safeSend(chatId, approved ? "✅ You have access." : "🚧 You do not have access yet.");
 });
 
 // ── /clearchat ───────────────────────────────────────────
@@ -868,10 +937,10 @@ bot.onText(/\/clearchat/, async (msg) => {
   if (!await checkMembership(msg)) return;
   try {
     await ChatHistory.deleteOne({ chatId: cid(chatId) });
-    bot.sendMessage(chatId, "🧹 Your chat history has been cleared.").catch(() => {});
+    await safeSend(chatId, "🧹 Your chat history has been cleared.");
   } catch (err) {
     console.error("clearchat error:", err.message);
-    bot.sendMessage(chatId, "⚠️ Could not clear history. Try again.").catch(() => {});
+    await safeSend(chatId, "⚠️ Could not clear history. Try again.");
   }
 });
 
@@ -896,7 +965,7 @@ bot.onText(/\/account/, async (msg) => {
     const usage    = userUsage.get(cid(chatId))     || {};
     const reset    = new Date(); reset.setUTCHours(24, 0, 0, 0);
 
-    bot.sendMessage(chatId, `👤 *My Account*
+    await safeSend(chatId, `👤 *My Account*
 ━━━━━━━━━━━━━
 📨 Requests: ${user.requests} / ${CFG.DAILY_REQUEST_LIMIT}
 🪙 Tokens: ${user.tokensUsed} / ${CFG.DAILY_TOKEN_LIMIT}
@@ -913,11 +982,11 @@ bot.onText(/\/account/, async (msg) => {
 🖼️ Photos: ${usage.img || 0} / ${CFG.IMG_LIMIT}
 🤖 Pro Reqs: ${usage.proTokens || 0} / ${CFG.PRO_LIMIT}`,
       { parse_mode: "Markdown" }
-    ).catch(() => {});
+    );
   } catch (err) {
     // FIX #16
     console.error("account error:", err.message);
-    bot.sendMessage(chatId, "⚠️ Could not load account info. Try again.").catch(() => {});
+    await safeSend(chatId, "⚠️ Could not load account info. Try again.");
   }
 });
 
@@ -927,7 +996,7 @@ bot.onText(/\/language/, async (msg) => {
   const buttons  = Object.entries(LANGUAGES).map(([c, n]) => ({ text: n, callback_data: `lang_${c}` }));
   const keyboard = [];
   for (let i = 0; i < buttons.length; i += 2) keyboard.push(buttons.slice(i, i + 2));
-  bot.sendMessage(msg.chat.id, "🌐 Choose your language:", { reply_markup: { inline_keyboard: keyboard } }).catch(() => {});
+  await safeSend(msg.chat.id, "🌐 Choose your language:", { reply_markup: { inline_keyboard: keyboard } });
 });
 
 // ── /setmodel ────────────────────────────────────────────
@@ -937,7 +1006,7 @@ bot.onText(/\/setmodel/, async (msg) => {
     text         : m.key ? m.name : `${m.name} ❌`,
     callback_data: m.key ? `model_${id}` : `unavailable_${id}`,
   }]);
-  bot.sendMessage(msg.chat.id, "🤖 Choose your AI model:", { reply_markup: { inline_keyboard: buttons } }).catch(() => {});
+  await safeSend(msg.chat.id, "🤖 Choose your AI model:", { reply_markup: { inline_keyboard: buttons } });
 });
 
 // ── Unified callback handler ──────────────────────────────
@@ -950,7 +1019,7 @@ bot.on("callback_query", async (query) => {
     userLanguages.set(cid(chatId), lang);
     User.findOneAndUpdate({ chatId: cid(chatId) }, { $set: { language: lang } }, { upsert: true }).catch(() => {});
     bot.answerCallbackQuery(query.id).catch(() => {});
-    bot.sendMessage(chatId, `✅ Language changed to ${LANGUAGES[lang]}`).catch(() => {});
+    await safeSend(chatId, `✅ Language changed to ${LANGUAGES[lang]}`);
     return;
   }
 
@@ -959,7 +1028,7 @@ bot.on("callback_query", async (query) => {
     userModels.set(cid(chatId), modelId);
     User.findOneAndUpdate({ chatId: cid(chatId) }, { $set: { selectedModel: modelId } }, { upsert: true }).catch(() => {});
     bot.answerCallbackQuery(query.id).catch(() => {});
-    bot.sendMessage(chatId, `✅ Model set to *${MODELS[modelId]?.name || modelId}*`, { parse_mode: "Markdown" }).catch(() => {});
+    await safeSend(chatId, `✅ Model set to *${MODELS[modelId]?.name || modelId}*`, { parse_mode: "Markdown" });
     return;
   }
 
@@ -979,10 +1048,10 @@ bot.onText(/\/imagine (.+)/, async (msg, match) => {
   if (!await guardAccess(msg))             return;
   if (!guardCommandRateLimit(msg, "imagine")) return;
   if (isProcessing(chatId)) {
-    return bot.sendMessage(chatId, "⏳ Your previous request is still in progress.").catch(() => {});
+    return safeSend(chatId, "⏳ Your previous request is still in progress.");
   }
   if (!checkLimit(chatId, "imagine", CFG.IMAGINE_LIMIT)) {
-    return bot.sendMessage(chatId, `⚠️ Daily image limit reached (${CFG.IMAGINE_LIMIT}). Try again tomorrow.`).catch(() => {});
+    return safeSend(chatId, `⚠️ Daily image limit reached (${CFG.IMAGINE_LIMIT}). Try again tomorrow.`);
   }
 
   const prompt = match[1];
@@ -1004,10 +1073,10 @@ bot.onText(/\/imagine (.+)/, async (msg, match) => {
   } catch (err) {
     const isTimeout = err.message?.startsWith("TIMEOUT");
     console.error("❌ Image error:", err.message);
-    bot.sendMessage(chatId, isTimeout
+    await safeSend(chatId, isTimeout
       ? "⚠️ Image generation timed out. Try again."
       : "⚠️ Could not generate image. Please try again."
-    ).catch(() => {});
+    );
   } finally {
     unmarkProcessing(chatId);
     if (placeholder?.message_id) bot.deleteMessage(chatId, placeholder.message_id).catch(() => {});
@@ -1022,10 +1091,10 @@ bot.onText(/\/search (.+)/, async (msg, match) => {
   if (!await guardAccess(msg))             return;
   if (!guardCommandRateLimit(msg, "search")) return;
   if (isProcessing(chatId)) {
-    return bot.sendMessage(chatId, "⏳ Your previous request is still in progress.").catch(() => {});
+    return safeSend(chatId, "⏳ Your previous request is still in progress.");
   }
   if (!checkLimit(chatId, "search", CFG.SEARCH_LIMIT)) {
-    return bot.sendMessage(chatId, `⚠️ Daily search limit reached (${CFG.SEARCH_LIMIT}). Try again tomorrow.`).catch(() => {});
+    return safeSend(chatId, `⚠️ Daily search limit reached (${CFG.SEARCH_LIMIT}). Try again tomorrow.`);
   }
 
   const query = match[1];
@@ -1053,7 +1122,7 @@ bot.onText(/\/search (.+)/, async (msg, match) => {
 
     if (placeholder?.message_id) bot.deleteMessage(chatId, placeholder.message_id).catch(() => {});
 
-    if (!results) return bot.sendMessage(chatId, "⚠️ No search results found.").catch(() => {});
+    if (!results) return safeSend(chatId, "⚠️ No search results found.");
 
     await safeSend(chatId, `🔍 *Results for:* ${query}\n\n${results}`, {
       parse_mode             : "Markdown",
@@ -1063,10 +1132,10 @@ bot.onText(/\/search (.+)/, async (msg, match) => {
   } catch (err) {
     if (placeholder?.message_id) bot.deleteMessage(chatId, placeholder.message_id).catch(() => {});
     console.error("❌ Search error:", err.message);
-    bot.sendMessage(chatId, err.message?.startsWith("TIMEOUT")
+    await safeSend(chatId, err.message?.startsWith("TIMEOUT")
       ? "⚠️ Search timed out. Try again."
       : "⚠️ Could not perform web search."
-    ).catch(() => {});
+    );
   } finally {
     unmarkProcessing(chatId);
   }
@@ -1080,15 +1149,15 @@ bot.on("document", async (msg) => {
   if (!await guardAccess(msg))     return;
   if (!guardRateLimitMedia(msg))   return;
   if (isProcessing(chatId)) {
-    return bot.sendMessage(chatId, "⏳ Your previous request is still in progress.").catch(() => {});
+    return safeSend(chatId, "⏳ Your previous request is still in progress.");
   }
   if (!checkLimit(chatId, "doc", CFG.DOC_LIMIT)) {
-    return bot.sendMessage(chatId, `⚠️ Daily document limit reached (${CFG.DOC_LIMIT}). Try again tomorrow.`).catch(() => {});
+    return safeSend(chatId, `⚠️ Daily document limit reached (${CFG.DOC_LIMIT}). Try again tomorrow.`);
   }
 
   const fileName = (msg.document.file_name || "").toLowerCase();
   if (![".pdf", ".docx", ".txt"].some(ext => fileName.endsWith(ext))) {
-    return bot.sendMessage(chatId, "⚠️ Only PDF, DOCX, or TXT files are supported.").catch(() => {});
+    return safeSend(chatId, "⚠️ Only PDF, DOCX, or TXT files are supported.");
   }
 
   markProcessing(chatId);
@@ -1100,7 +1169,7 @@ bot.on("document", async (msg) => {
           fileBuffer = await downloadFile(msg.document.file_id);
         } catch (err) {
           if (err.message?.startsWith("FILE_TOO_LARGE"))
-            return bot.sendMessage(chatId, `⚠️ File too large. Max: ${CFG.MAX_FILE_MB} MB.`).catch(() => {});
+            return safeSend(chatId, `⚠️ File too large. Max: ${CFG.MAX_FILE_MB} MB.`);
           throw err;
         }
 
@@ -1116,7 +1185,7 @@ bot.on("document", async (msg) => {
         }
         fileBuffer = null; // FIX #24: release buffer ASAP
 
-        if (!text.trim()) return bot.sendMessage(chatId, "⚠️ No readable text found.").catch(() => {});
+        if (!text.trim()) return safeSend(chatId, "⚠️ No readable text found.");
         if (text.length > CFG.DOC_CHAR_LIMIT) text = text.slice(0, CFG.DOC_CHAR_LIMIT);
 
         const model  = genAI.getGenerativeModel({ model: process.env.GEMINI_MODEL_5 });
@@ -1134,14 +1203,14 @@ bot.on("document", async (msg) => {
     });
   } catch (err) {
     console.error("❌ Document error:", err.message);
-    bot.sendMessage(chatId, err.message === "QUEUE_FULL"
+    await safeSend(chatId, err.message === "QUEUE_FULL"
       ? "⚠️ Bot is busy. Please try again in a moment."
       : err.message?.startsWith("TIMEOUT")
         ? "⚠️ Analysis timed out. Try a smaller file."
         : err.message?.toLowerCase().includes("file is too big")
           ? `⚠️ File too large. Max: ${CFG.MAX_FILE_MB} MB.`
           : "⚠️ Could not analyse your document."
-    ).catch(() => {});
+    );
   } finally {
     unmarkProcessing(chatId);
   }
@@ -1164,10 +1233,10 @@ bot.on("photo", async (msg) => {
   if (!await guardAccess(msg))     return;
   if (!guardRateLimitMedia(msg))   return;
   if (isProcessing(chatId)) {
-    return bot.sendMessage(chatId, "⏳ Your previous request is still in progress.").catch(() => {});
+    return safeSend(chatId, "⏳ Your previous request is still in progress.");
   }
   if (!checkLimit(chatId, "img", CFG.IMG_LIMIT)) {
-    return bot.sendMessage(chatId, `⚠️ Daily image analysis limit reached (${CFG.IMG_LIMIT}). Try again tomorrow.`).catch(() => {});
+    return safeSend(chatId, `⚠️ Daily image analysis limit reached (${CFG.IMG_LIMIT}). Try again tomorrow.`);
   }
 
   const photo = msg.photo[msg.photo.length - 1];
@@ -1180,7 +1249,7 @@ bot.on("photo", async (msg) => {
           fileBuffer = await downloadFile(photo.file_id);
         } catch (err) {
           if (err.message?.startsWith("FILE_TOO_LARGE"))
-            return bot.sendMessage(chatId, `⚠️ Image too large. Max: ${CFG.MAX_FILE_MB} MB.`).catch(() => {});
+            return safeSend(chatId, `⚠️ Image too large. Max: ${CFG.MAX_FILE_MB} MB.`);
           throw err;
         }
 
@@ -1202,14 +1271,14 @@ bot.on("photo", async (msg) => {
     });
   } catch (err) {
     console.error("❌ Image analysis error:", err.message);
-    bot.sendMessage(chatId, err.message === "QUEUE_FULL"
+    await safeSend(chatId, err.message === "QUEUE_FULL"
       ? "⚠️ Bot is busy. Please try again in a moment."
       : err.message?.startsWith("TIMEOUT")
         ? "⚠️ Analysis timed out. Try a smaller image."
         : err.message?.toLowerCase().includes("file is too big")
           ? `⚠️ Image too large. Max: ${CFG.MAX_FILE_MB} MB.`
           : "⚠️ Could not analyse your image."
-    ).catch(() => {});
+    );
   } finally {
     unmarkProcessing(chatId);
   }
@@ -1228,17 +1297,17 @@ bot.on("message", async (msg) => {
   if (!guardRateLimit(msg))        return;
 
   if (/^https?:\/\//i.test(text.trim())) {
-    return bot.sendMessage(chatId, "⚠️ Links are not allowed.").catch(() => {});
+    return safeSend(chatId, "⚠️ Links are not allowed.");
   }
 
   // Reply keyboard shortcuts
-  if (text === "🔍 Search")          return bot.sendMessage(chatId, "🔍 Type: `/search your query`",  { parse_mode: "Markdown" }).catch(() => {});
-  if (text === "🎨 Imagine")         return bot.sendMessage(chatId, "🎨 Type: `/imagine your prompt`", { parse_mode: "Markdown" }).catch(() => {});
-  if (text === "🚫 Report Error")    return bot.sendMessage(chatId, `Contact ${CFG.FORCE_CHANNEL} to report problems.`).catch(() => {});
-  if (text === "📄 Document Analysis") return bot.sendMessage(chatId, "📤 Send any document or image for analysis.").catch(() => {});
+  if (text === "🔍 Search")            return safeSend(chatId, "🔍 Type: `/search your query`",  { parse_mode: "Markdown" });
+  if (text === "🎨 Imagine")           return safeSend(chatId, "🎨 Type: `/imagine your prompt`", { parse_mode: "Markdown" });
+  if (text === "🚫 Report Error")      return safeSend(chatId, `Contact ${CFG.FORCE_CHANNEL} to report problems.`);
+  if (text === "📄 Document Analysis") return safeSend(chatId, "📤 Send any document or image for analysis.");
 
   if (isProcessing(chatId)) {
-    return bot.sendMessage(chatId, "⏳ Your previous request is still in progress. Please wait.").catch(() => {});
+    return safeSend(chatId, "⏳ Your previous request is still in progress. Please wait.");
   }
 
   markProcessing(chatId);
@@ -1256,12 +1325,12 @@ bot.on("message", async (msg) => {
       }
 
       if (user.requests  >= CFG.DAILY_REQUEST_LIMIT) {
-        return bot.sendMessage(chatId, `⚠️ Daily request limit (${CFG.DAILY_REQUEST_LIMIT}) reached. Try again tomorrow.`).catch(() => {});
+        return safeSend(chatId, `⚠️ Daily request limit (${CFG.DAILY_REQUEST_LIMIT}) reached. Try again tomorrow.`);
       }
 
       const inputTokens = Math.ceil(text.split(/\s+/).length * 1.3);
       if (user.tokensUsed + inputTokens >= CFG.DAILY_TOKEN_LIMIT) {
-        return bot.sendMessage(chatId, `⚠️ Daily token limit (${CFG.DAILY_TOKEN_LIMIT}) reached. Try again tomorrow.`).catch(() => {});
+        return safeSend(chatId, `⚠️ Daily token limit (${CFG.DAILY_TOKEN_LIMIT}) reached. Try again tomorrow.`);
       }
 
       await hydrateUserPrefs(chatId);
@@ -1274,9 +1343,9 @@ bot.on("message", async (msg) => {
       try {
         aiResult = await withThinkingIndicator(chatId, "🤔 Thinking…", () => getAIReply(chatId, text, history, lang));
       } catch (err) {
-        if (err.message?.startsWith("PRO_LIMIT")) return bot.sendMessage(chatId, `⚠️ Pro model daily limit reached. Use /setmodel.`).catch(() => {});
-        if (err.message === "NO_KEY")              return bot.sendMessage(chatId, "⚠️ Model unavailable. Use /setmodel.").catch(() => {});
-        if (err.message?.startsWith("TIMEOUT"))    return bot.sendMessage(chatId, "⚠️ AI took too long to respond. Try again.").catch(() => {});
+        if (err.message?.startsWith("PRO_LIMIT")) return safeSend(chatId, `⚠️ Pro model daily limit reached. Use /setmodel.`);
+        if (err.message === "NO_KEY")              return safeSend(chatId, "⚠️ Model unavailable. Use /setmodel.");
+        if (err.message?.startsWith("TIMEOUT"))    return safeSend(chatId, "⚠️ AI took too long to respond. Try again.");
         throw err;
       }
 
@@ -1285,7 +1354,7 @@ bot.on("message", async (msg) => {
       const totalTokens   = inputTokens + outputTokens;
 
       if (user.tokensUsed + totalTokens > CFG.DAILY_TOKEN_LIMIT) {
-        return bot.sendMessage(chatId, "⚠️ Reply would exceed daily token limit. Try again tomorrow.").catch(() => {});
+        return safeSend(chatId, "⚠️ Reply would exceed daily token limit. Try again tomorrow.");
       }
 
       // Atomic DB update — FIX #8: lastActive always updated here
@@ -1296,6 +1365,8 @@ bot.on("message", async (msg) => {
           $set: { lastActive: new Date() },
         }
       );
+      // Bump global daily aggregated stats
+      bumpStats({ tokens: totalTokens, requests: 1 });
 
       await appendChatHistory(chatId, text, reply);
 
@@ -1308,10 +1379,10 @@ bot.on("message", async (msg) => {
     });
   } catch (err) {
     if (err.message === "QUEUE_FULL") {
-      return bot.sendMessage(chatId, "⚠️ Bot is very busy. Please try again shortly.").catch(() => {});
+      return safeSend(chatId, "⚠️ Bot is very busy. Please try again shortly.");
     }
     console.error("❌ Chat error:", err.message);
-    bot.sendMessage(chatId, "❌ Something went wrong. Please try again.").catch(() => {});
+    await safeSend(chatId, "❌ Something went wrong. Please try again.");
   } finally {
     unmarkProcessing(chatId);
   }
@@ -1335,25 +1406,29 @@ bot.onText(/\/broadcast (.+)/, async (msg, match) => {
   }
 });
 
-// ── /usage ───────────────────────────────────────────────
+// ── /usage ── single aggregated daily summary ────────────
 bot.onText(/\/usage/, async (msg) => {
   if (msg.chat.id !== CFG.ADMIN_ID) return;
   try {
-    const today  = utcToday();
-    let report   = `📊 *Usage Report* (${today})\n━━━━━━━━━━━━━\n`;
-    let count    = 0;
-    const cursor = User.find({}, { chatId: 1, requests: 1, tokensUsed: 1 }).cursor();
+    const today = utcToday();
+    const stats = await DailyStats.findOne({ date: today });
+    const totalUsers = await User.countDocuments();
 
-    for await (const u of cursor) {
-      const usage = userUsage.get(cid(u.chatId)) || {};
-      report += `\n👤 \`${u.chatId}\`\nReqs: ${u.requests} | Tokens: ${u.tokensUsed}\n🔍${usage.search||0} 🎨${usage.imagine||0} 📄${usage.doc||0} 🖼️${usage.img||0}\n━━━━━━`;
-      count++;
-      if (count % 20 === 0) {
-        await bot.sendMessage(CFG.ADMIN_ID, report, { parse_mode: "Markdown" }).catch(() => {});
-        report = "";
-      }
-    }
-    if (report) bot.sendMessage(CFG.ADMIN_ID, report, { parse_mode: "Markdown" }).catch(() => {});
+    const report =
+      `📊 *Daily Summary* (${today})\n` +
+      `━━━━━━━━━━━━━━━━━━━━━━\n` +
+      `👥 Total users in DB: ${totalUsers}\n` +
+      `━━━━━━━━━━━━━━━━━━━━━━\n` +
+      `📨 Requests today:  ${stats?.requests  || 0}\n` +
+      `🪙 Tokens today:    ${stats?.tokens    || 0}\n` +
+      `🔍 Searches today:  ${stats?.search    || 0}\n` +
+      `🎨 Images today:    ${stats?.imagine   || 0}\n` +
+      `📄 Docs today:      ${stats?.doc       || 0}\n` +
+      `🖼️ Img analyses:    ${stats?.img       || 0}\n` +
+      `━━━━━━━━━━━━━━━━━━━━━━\n` +
+      `_(resets at UTC midnight)_`;
+
+    bot.sendMessage(CFG.ADMIN_ID, report, { parse_mode: "Markdown" }).catch(() => {});
   } catch (err) {
     console.error("usage error:", err.message);
     bot.sendMessage(CFG.ADMIN_ID, "⚠️ Could not generate usage report.").catch(() => {});

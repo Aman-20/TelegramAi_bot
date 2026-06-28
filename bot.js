@@ -94,7 +94,7 @@ mongoose.connection.on("error", (err) => {
 async function connectDB() {
   try {
     await mongoose.connect(process.env.MONGODB_CONNECT, {
-      dbName                 : "TelegramAi",
+      dbName                 : "Telegram",
       serverSelectionTimeoutMS: 10000,
       socketTimeoutMS        : 45000,
       maxPoolSize            : 10,   // respect Atlas Free connection cap
@@ -461,6 +461,7 @@ async function checkMembership(msg) {
     reply_markup: {
       inline_keyboard: [[
         { text: "📢 Join Channel", url: `https://t.me/${CFG.FORCE_CHANNEL.replace("@", "")}` },
+        { text: "✅ I have joined", callback_data: "verify_membership" },
       ]],
     },
   });
@@ -1029,6 +1030,23 @@ bot.on("callback_query", async (query) => {
     User.findOneAndUpdate({ chatId: cid(chatId) }, { $set: { selectedModel: modelId } }, { upsert: true }).catch(() => {});
     bot.answerCallbackQuery(query.id).catch(() => {});
     await safeSend(chatId, `✅ Model set to *${MODELS[modelId]?.name || modelId}*`, { parse_mode: "Markdown" });
+    return;
+  }
+
+  if (data === "verify_membership") {
+    // Force a fresh Telegram API check by evicting the cached result first
+    membershipCache.delete(cid(chatId));
+    const joined = await isUserMember(chatId);
+    if (joined) {
+      bot.answerCallbackQuery(query.id, { text: "✅ Verified! You can now use the bot.", show_alert: false }).catch(() => {});
+      await bot.editMessageReplyMarkup({ inline_keyboard: [] }, {
+        chat_id   : chatId,
+        message_id: query.message.message_id,
+      }).catch(() => {});
+      await safeSend(chatId, "✅ Access granted! Send /start to begin.");
+    } else {
+      bot.answerCallbackQuery(query.id, { text: "❌ You haven't joined yet. Please join the channel first.", show_alert: true }).catch(() => {});
+    }
     return;
   }
 

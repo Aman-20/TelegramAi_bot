@@ -456,7 +456,9 @@ async function isUserMember(chatId) {
 
 async function checkMembership(msg) {
   const chatId = msg.chat.id;
-  if (await isUserMember(chatId)) return true;
+  // In groups, msg.chat.id is the group ID — always check the actual user (msg.from.id)
+  const userId = msg.from?.id || chatId;
+  if (await isUserMember(userId)) return true;
   await safeSend(chatId, "⚠️ You must join our channel first to use this bot.", {
     reply_markup: {
       inline_keyboard: [[
@@ -1034,16 +1036,17 @@ bot.on("callback_query", async (query) => {
   }
 
   if (data === "verify_membership") {
-    // Force a fresh Telegram API check by evicting the cached result first
-    membershipCache.delete(cid(chatId));
-    const joined = await isUserMember(chatId);
+    // query.from.id is always the actual user — works in both private and groups
+    const userId = query.from.id;
+    membershipCache.delete(cid(userId));
+    const joined = await isUserMember(userId);
     if (joined) {
       bot.answerCallbackQuery(query.id, { text: "✅ Verified! You can now use the bot.", show_alert: false }).catch(() => {});
       await bot.editMessageReplyMarkup({ inline_keyboard: [] }, {
         chat_id   : chatId,
         message_id: query.message.message_id,
       }).catch(() => {});
-      await safeSend(chatId, "✅ Access granted! Send /start to begin.");
+      await safeSend(chatId, `✅ @${query.from.username || query.from.first_name} is verified! You can now use the bot.`);
     } else {
       bot.answerCallbackQuery(query.id, { text: "❌ You haven't joined yet. Please join the channel first.", show_alert: true }).catch(() => {});
     }

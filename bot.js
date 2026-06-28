@@ -94,7 +94,7 @@ mongoose.connection.on("error", (err) => {
 async function connectDB() {
   try {
     await mongoose.connect(process.env.MONGODB_CONNECT, {
-      dbName                 : "Telegram",
+      dbName                 : "TelegramAi",
       serverSelectionTimeoutMS: 10000,
       socketTimeoutMS        : 45000,
       maxPoolSize            : 10,   // respect Atlas Free connection cap

@@ -645,6 +645,19 @@ async function safeSend(chatId, text, opts = {}) {
       return;
     }
 
+    // 400 "not enough rights" / "have no rights" — bot not admin in group: eat silently
+    if (
+      code === 400 && (
+        msg.includes("not enough rights") ||
+        msg.includes("have no rights")    ||
+        msg.includes("need administrator") ||
+        msg.includes("CHAT_WRITE_FORBIDDEN")
+      )
+    ) {
+      // Bot is not an admin in this group — cannot send messages; silently return null
+      return null;
+    }
+
     // 5xx / network — Telegram outage or dropped connection: log it, don't crash
     if (code >= 500 || msg.includes("ETIMEOUT") || msg.includes("ECONNRESET") || msg.includes("socket hang up")) {
       console.error(`❌ Telegram server/network error for ${chatId} (${code || "network"}):`, msg);
@@ -1310,6 +1323,23 @@ bot.on("photo", async (msg) => {
 bot.on("message", async (msg) => {
   const chatId = msg.chat.id;
   const text   = msg.text;
+
+  // ── Bot added to a group: prompt users to make it admin ──
+  if (msg.new_chat_members) {
+    const BOT_INFO = await bot.getMe().catch(() => null);
+    const isMe = BOT_INFO && msg.new_chat_members.some(m => m.id === BOT_INFO.id);
+    if (isMe) {
+      // safeSend handles the case where bot is not yet admin (returns null silently)
+      await safeSend(
+        chatId,
+        `👋 *Thanks for adding me!*\n\n` +
+        `⚠️ *Important:* Please make me an *Admin* in this group so I can send messages and respond to users.\n\n` +
+        `Once I'm an admin, users can chat with me directly here! 🚀`,
+        { parse_mode: "Markdown" }
+      );
+    }
+    return;
+  }
 
   if (!text || text.startsWith("/") || msg.photo || msg.document) return;
 

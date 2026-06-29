@@ -1101,7 +1101,7 @@ bot.onText(/\/imagine (.+)/, async (msg, match) => {
     if (!res.ok) throw new Error(`Pollinations error: ${res.status}`);
     const buf = Buffer.from(await res.arrayBuffer());
 
-    await bot.sendPhoto(chatId, buf, { caption: `🎨 ${prompt}` });
+    await bot.sendPhoto(chatId, { source: buf, filename: "image.jpg" }, { caption: `🎨 ${prompt}` });
     // FIX #8: update lastActive
     touchLastActive(chatId);
   } catch (err) {

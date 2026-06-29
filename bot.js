@@ -1100,8 +1100,12 @@ bot.onText(/\/imagine (.+)/, async (msg, match) => {
     const res      = await withTimeout(fetch(imageUrl), CFG.API_TIMEOUT_MS, "pollinations");
     if (!res.ok) throw new Error(`Pollinations error: ${res.status}`);
     const buf = Buffer.from(await res.arrayBuffer());
-
-    await bot.sendPhoto(chatId, { source: buf, filename: "image.jpg" }, { caption: `🎨 ${prompt}` });
+    await bot.sendPhoto(
+      chatId, 
+      buf, 
+      { caption: `🎨 ${prompt}` }, 
+      { filename: 'image.jpg', contentType: 'image/jpeg' }
+    );
     // FIX #8: update lastActive
     touchLastActive(chatId);
   } catch (err) {
